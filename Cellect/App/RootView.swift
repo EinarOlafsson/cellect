@@ -19,12 +19,16 @@ struct RootView: View {
                         )
                     }
 
-                    FeatureRow(
-                        systemImage: "scribble.variable",
-                        title: "Touch Segmentation",
-                        subtitle: "Paint masks on images — coming soon",
-                        enabled: false
-                    )
+                    NavigationLink {
+                        SegmentationProjectListView()
+                    } label: {
+                        FeatureRow(
+                            systemImage: "scribble.variable",
+                            title: "Touch Segmentation",
+                            subtitle: "Paint semantic masks on images",
+                            enabled: true
+                        )
+                    }
                 }
 
                 Section("Capture") {
@@ -74,5 +78,7 @@ private struct FeatureRow: View {
 }
 
 #Preview {
-    RootView().environment(ProjectStore())
+    RootView()
+        .environment(ProjectStore())
+        .environment(SegmentationStore())
 }

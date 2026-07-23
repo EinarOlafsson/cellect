@@ -87,6 +87,21 @@ A01_f02.tif,interphase,
 A02_f01.tif,,blurry
 ```
 
+## 4b. Mask contract (touch segmentation — feature 3)
+
+- Each image `A01.tif` gets a sibling **`A01_mask.png`** in the same folder: an 8-bit
+  **grayscale PNG where each pixel value == the class id** (`0` = background). Directly loadable
+  by `numpy`/`PIL`/spacr as a label image.
+- A folder-level **`cellect_classes.json`** records `[{id,label,color}]` so ids are interpretable.
+- **Resolution cap:** the editing canvas + exported mask are capped to a long side of
+  `SegmentationConfig.maxDimension` (2048) for smooth on-device painting. The mask matches the
+  decoded (possibly downscaled) image, so re-opening lines up. Raising the cap trades memory for
+  full native resolution — a known future toggle.
+- **Paint engine** (`MaskBitmap`): parallel label (UInt8/px) + premultiplied-RGBA overlay
+  buffers; brush stamps are region-scoped (cost ∝ brush area, not image size); undo/redo are
+  per-stroke pixel diffs; the overlay CGImage wraps the RGBA buffer with a non-copying provider,
+  so it rebuilds cheaply on every touch-move.
+
 ## 5. Storage abstraction (`Services/Storage/`)
 
 ```swift

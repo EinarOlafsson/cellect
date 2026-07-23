@@ -49,10 +49,10 @@ See [docs/BUILDING.md](docs/BUILDING.md) for signing, device deployment, and CI 
 | Slice | State |
 |-------|-------|
 | Project scaffold (XcodeGen, app shell) | ✅ initial |
-| Swipe annotation (feature 2) | 🚧 in progress |
-| Local + iCloud folder access | 🚧 in progress |
+| Swipe annotation (feature 2) | ✅ built |
+| Local + iCloud folder access | ✅ built |
+| Touch semantic segmentation (feature 3) | ✅ built |
 | Google Drive provider | ⬜ stubbed (protocol in place) |
-| Camera cell counting (feature 1) | ⬜ not started |
-| Touch semantic segmentation (feature 3) | ⬜ not started |
+| Camera cell counting (feature 1) | 🚧 next |
 | Community backend (feature 4) | ⬜ not started |
 | On-device training | ⬜ future |
