@@ -32,12 +32,16 @@ struct RootView: View {
                 }
 
                 Section("Capture") {
-                    FeatureRow(
-                        systemImage: "camera.viewfinder",
-                        title: "Camera Cell Count",
-                        subtitle: "Photograph & count cells — coming soon",
-                        enabled: false
-                    )
+                    NavigationLink {
+                        CaptureProjectListView()
+                    } label: {
+                        FeatureRow(
+                            systemImage: "camera.viewfinder",
+                            title: "Camera Cell Count",
+                            subtitle: "Photograph & count cells to a folder",
+                            enabled: true
+                        )
+                    }
                 }
 
                 Section("Community") {
@@ -81,4 +85,5 @@ private struct FeatureRow: View {
     RootView()
         .environment(ProjectStore())
         .environment(SegmentationStore())
+        .environment(CaptureStore())
 }

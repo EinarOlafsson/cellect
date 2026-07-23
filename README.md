@@ -52,7 +52,7 @@ See [docs/BUILDING.md](docs/BUILDING.md) for signing, device deployment, and CI 
 | Swipe annotation (feature 2) | ✅ built |
 | Local + iCloud folder access | ✅ built |
 | Touch semantic segmentation (feature 3) | ✅ built |
+| Camera cell counting (feature 1) | ✅ built (classical tier; Core ML tiers stubbed) |
 | Google Drive provider | ⬜ stubbed (protocol in place) |
-| Camera cell counting (feature 1) | 🚧 next |
-| Community backend (feature 4) | ⬜ not started |
+| Community backend (feature 4) | 🚧 next |
 | On-device training | ⬜ future |
