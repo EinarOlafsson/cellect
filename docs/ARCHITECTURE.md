@@ -134,6 +134,28 @@ Writing the CSV on every swipe would thrash iCloud/Drive. Mirroring the desktop
   the merged CSV via `StorageProvider.writeFile`.
 - A local mirror (JSON now; SQLite if it grows) enables crash-safe resume before any flush lands.
 
+## 6b. Cell counting (feature 1)
+
+Model-agnostic core in `Features/CameraCount/`:
+
+- **`CellCounter` protocol** → `CountResult` (per-object area/centroid/bbox + a 16-bit instance
+  label mask + optional µm/px calibration). Counters run on the capped CGImage as given, so the
+  returned mask lines up with the image saved.
+- **Tier ladder** (`CounterTier`): `classical < low < medium < high < best`. `CounterRegistry`
+  offers the classical floor plus any bundled Core ML tiers the device's memory ceiling
+  (`DeviceCapability`) allows, best-first. So a newer phone runs a heavier model; an older one
+  drops to a lighter tier or classical — automatically.
+- **`ClassicalCellCounter`** (built): Otsu threshold → 8-connected components (union-find) →
+  area filter → size stats. Always available, no model/network.
+- **Core ML tiers** (`CoreMLCounterSpec.bundled`, currently empty): convert a Cellpose/SAM model
+  to `.mlmodelc`, add a spec, drop it in the bundle → the registry starts offering it. Candidates:
+  small Cellpose or a distilled SAM (MobileSAM/EdgeSAM/EfficientSAM) at the top tiers.
+- **Known gap:** classical counts touching cells as one blob. Next refinement is distance-transform
+  **watershed** splitting before the model tiers land.
+- **Upload:** the captured (capped) image + `<image>_mask.png` (16-bit instance labels) + a
+  per-object CSV (id, area, equivalent diameter in px and µm) go to the project's folder via
+  `StorageProvider` — same portable-folder contract as the other features.
+
 ## 7. Community backend (feature 4 — design only, not built)
 
 - Maintainer shares a Drive folder (read for images, write for results).
