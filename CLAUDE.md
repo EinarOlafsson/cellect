@@ -3,6 +3,10 @@
 Orientation for any Claude Code session working on this repo (especially a **Mac** session that
 can actually build). Read this first.
 
+> **Resuming a handed-off session?** Read **`docs/HANDOFF.md`** next — it has the full vision,
+> every decision made, current state, and prioritized next steps. Carried-over working preferences
+> and project memory are in **`docs/context/memory/`** (re-seed them into your memory if useful).
+
 ## What this is
 
 Cellect is a **native iOS SwiftUI app** (iOS 17+) for microscopy image annotation and citizen
