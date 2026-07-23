@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Cellect</string>
+	<key>CFBundleDisplayName</key>
+	<string>Cellect</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>UILaunchScreen</key>
+	<dict/>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<!-- iCloud Drive: let the app read/write documents so folder picking + CSV works -->
+	<key>NSUbiquitousContainerIsDocumentScopePublic</key>
+	<true/>
+	<key>UISupportsDocumentBrowser</key>
+	<false/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<!-- Camera + photo usage strings (feature 1, declared now so we don't forget) -->
+	<key>NSCameraUsageDescription</key>
+	<string>Cellect uses the camera to photograph cells through your microscope for counting and annotation.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Cellect can import microscopy images from your photo library for annotation.</string>
+</dict>
+</plist>

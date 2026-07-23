@@ -1,0 +1,36 @@
+# XcodeGen spec. Run `xcodegen generate` to produce Cellect.xcodeproj.
+# https://github.com/yonaskolb/XcodeGen
+name: Cellect
+options:
+  bundleIdPrefix: com.cellect
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    DEVELOPMENT_TEAM: ""          # fill with your Apple Team ID in Xcode → Signing
+    CODE_SIGN_STYLE: Automatic
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    GENERATE_INFOPLIST_FILE: NO
+
+targets:
+  Cellect:
+    type: application
+    platform: iOS
+    sources:
+      - path: Cellect
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cellect.app
+        INFOPLIST_FILE: Cellect/Resources/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        TARGETED_DEVICE_FAMILY: "1,2"    # iPhone + iPad
+        SUPPORTS_MACCATALYST: NO
+    # Google Drive / other SPM deps get added here later, e.g.:
+    # dependencies:
+    #   - package: GoogleSignIn
