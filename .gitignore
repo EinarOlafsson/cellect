@@ -16,3 +16,15 @@ xcuserdata/
 GoogleService-Info.plist
 *.p12
 *.mobileprovision
+
+# Generated ML artifacts and transfer bundles. Keep source, conversion scripts,
+# manifests, and evaluation reports in Git; publish selected model binaries as
+# versioned release assets after they have passed on-device validation.
+Cellect/Resources/Models/*.mlpackage/
+Cellect/Resources/Models/*.mlmodel
+Cellect/Resources/Models/*.mlmodelc/
+Cellect_RTX3090_Training_Bundle*.zip
+
+# Local handoff and interpreter artifacts.
+*.dataless-backup
+__pycache__/

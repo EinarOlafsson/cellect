@@ -1,0 +1,4 @@
+# Intel macOS-compatible conversion environment used for the validated packages.
+numpy==1.26.4
+torch==2.2.2
+coremltools==7.2

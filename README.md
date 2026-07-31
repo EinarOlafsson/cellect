@@ -9,8 +9,8 @@ Cellect turns a phone into a microscopy annotation station. It targets four capa
 built in slices:
 
 1. **Camera cell counting** — photograph cells through a microscope (DIC / BF / Phase),
-   segment + count them on-device, and upload the image, the mask, and a per-object CSV
-   (count + size) to a linked Google Drive or iCloud folder.
+   segment + count them on-device, and save the image, 16-bit instance mask, exact settings,
+   and per-object measurements to a Files/iCloud project folder.
 2. **Swipe annotation** *(building first)* — point at a folder of images, swipe to assign
    classes, and write a CSV (`filename` + user-named columns) back into the folder. Multiple
    rounds add multiple columns.
@@ -44,6 +44,19 @@ open Cellect.xcodeproj        # build & run on a simulator or device (⌘R)
 
 See [docs/BUILDING.md](docs/BUILDING.md) for signing, device deployment, and CI options.
 
+## Trained model assets
+
+The app supports nine workstation-trained Core ML foreground/contact-boundary models and an
+always-available Classical CV fallback. Generated `.mlpackage` directories are intentionally
+excluded from ordinary Git because the complete development set is about 864 MB and contains
+files above GitHub's regular file limit.
+
+Place locally converted packages in `Cellect/Resources/Models/` before running XcodeGen. The
+training, verification, import, and Core ML conversion workflows are documented in
+`WorkstationTrainingBundle/` and `WorkstationResults/`. A source-only clone still builds and runs
+with Classical CV; selected validated packages can later be published as release assets or with
+Git LFS.
+
 ## Status
 
 | Slice | State |
@@ -52,7 +65,10 @@ See [docs/BUILDING.md](docs/BUILDING.md) for signing, device deployment, and CI 
 | Swipe annotation (feature 2) | ✅ built |
 | Local + iCloud folder access | ✅ built |
 | Touch semantic segmentation (feature 3) | ✅ built |
-| Camera cell counting (feature 1) | ✅ built (classical tier; Core ML tiers stubbed) |
+| Camera cell counting (feature 1) | ✅ built (Classical CV + nine-model Core ML registry) |
+| Model/settings comparison | ✅ built (bounded sweeps, overlay slider, mask export) |
+| Workstation training/evaluation pipeline | ✅ reproducible source + reports |
+| Automated iOS tests | ✅ planner, probability fusion, descriptions, mask round-trip |
 | Google Drive provider | ⬜ stubbed (protocol in place) |
 | Community backend (feature 4) | 🚧 next |
 | On-device training | ⬜ future |

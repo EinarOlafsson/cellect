@@ -204,7 +204,7 @@ struct SwipeAnnotationView: View {
         max(abs(dragOffset.width), abs(dragOffset.height))
     }
 
-    private func dragGesture(in size: CGSize) -> some Gesture {
+    private func dragGesture(in size: CGSize) -> some SwiftUI.Gesture {
         DragGesture()
             .onChanged { value in
                 if flyAway == nil { dragOffset = value.translation }

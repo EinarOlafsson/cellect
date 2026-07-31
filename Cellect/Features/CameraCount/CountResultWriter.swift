@@ -7,20 +7,46 @@ struct CountResultWriter {
     let provider: StorageProvider
     let project: CaptureProject
 
-    /// Returns the stem used for the written files (e.g. "capture_20260723_101530").
+    /// Returns the stem used for the written files (e.g. "capture_20260723_101530_a1b2c3d4").
     @discardableResult
-    func save(image: CGImage, result: CountResult, counterName: String, timestamp: Date) async throws -> String {
-        let stem = "capture_\(Self.stamp(timestamp))"
+    func save(
+        image: CGImage,
+        result: CountResult,
+        counterIdentifier: String,
+        counterName: String,
+        options: CountOptions,
+        runID: UUID,
+        inferenceStartedAt: Date,
+        inferenceCompletedAt: Date,
+        timestamp: Date
+    ) async throws -> String {
+        let shortRunID = runID.uuidString.prefix(8).lowercased()
+        let stem = "capture_\(Self.stamp(inferenceStartedAt))_\(shortRunID)"
 
-        if let png = MaskPNG.encodePNG(image) {
-            try await provider.writeFile(named: "\(stem).png", data: png)
+        guard let png = MaskPNG.encodePNG(image) else {
+            throw CountWriteError.imageEncodingFailed
         }
-        if let maskPNG = MaskPNG.label16(result.labelMask,
-                                         width: Int(result.imageSize.width),
-                                         height: Int(result.imageSize.height)) {
-            try await provider.writeFile(named: "\(stem)_mask.png", data: maskPNG)
+        try await provider.writeFile(named: "\(stem).png", data: png)
+        guard let maskPNG = MaskPNG.label16(
+            result.labelMask,
+            width: Int(result.imageSize.width),
+            height: Int(result.imageSize.height)
+        ) else {
+            throw CountWriteError.maskEncodingFailed
         }
+        try await provider.writeFile(named: "\(stem)_mask.png", data: maskPNG)
         try await writeObjectsCSV(stem: stem, result: result)
+        try await writeSettings(
+            stem: stem,
+            result: result,
+            counterIdentifier: counterIdentifier,
+            counterName: counterName,
+            options: options,
+            runID: runID,
+            inferenceStartedAt: inferenceStartedAt,
+            inferenceCompletedAt: inferenceCompletedAt,
+            timestamp: timestamp
+        )
         try await appendSummary(stem: stem, result: result, counterName: counterName, timestamp: timestamp)
         return stem
     }
@@ -49,6 +75,46 @@ struct CountResultWriter {
         }
         let text = CSV.serialize(header: header, rows: rows)
         try await provider.writeFile(named: "\(stem)_objects.csv", data: Data(text.utf8))
+    }
+
+    private func writeSettings(
+        stem: String,
+        result: CountResult,
+        counterIdentifier: String,
+        counterName: String,
+        options: CountOptions,
+        runID: UUID,
+        inferenceStartedAt: Date,
+        inferenceCompletedAt: Date,
+        timestamp: Date
+    ) async throws {
+        let record = RunSettingsRecord(
+            schemaVersion: 2,
+            runID: runID,
+            modelIdentifier: counterIdentifier,
+            modelName: counterName,
+            appVersion: Bundle.main.object(
+                forInfoDictionaryKey: "CFBundleShortVersionString"
+            ) as? String,
+            buildNumber: Bundle.main.object(
+                forInfoDictionaryKey: "CFBundleVersion"
+            ) as? String,
+            inferenceStartedAt: inferenceStartedAt,
+            inferenceCompletedAt: inferenceCompletedAt,
+            timestamp: timestamp,
+            imageWidth: Int(result.imageSize.width),
+            imageHeight: Int(result.imageSize.height),
+            detectedObjectCount: result.count,
+            options: options,
+            diagnostics: result.diagnostics
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        try await provider.writeFile(
+            named: "\(stem)_settings.json",
+            data: try encoder.encode(record)
+        )
     }
 
     private func appendSummary(stem: String, result: CountResult, counterName: String, timestamp: Date) async throws {
@@ -87,4 +153,33 @@ struct CountResultWriter {
         f.dateFormat = "yyyyMMdd_HHmmss"
         return f.string(from: date)
     }
+}
+
+private enum CountWriteError: LocalizedError {
+    case imageEncodingFailed
+    case maskEncodingFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .imageEncodingFailed: return "The captured image could not be encoded as PNG."
+        case .maskEncodingFailed:  return "The instance mask could not be encoded as PNG."
+        }
+    }
+}
+
+private struct RunSettingsRecord: Codable {
+    let schemaVersion: Int
+    let runID: UUID
+    let modelIdentifier: String
+    let modelName: String
+    let appVersion: String?
+    let buildNumber: String?
+    let inferenceStartedAt: Date
+    let inferenceCompletedAt: Date
+    let timestamp: Date
+    let imageWidth: Int
+    let imageHeight: Int
+    let detectedObjectCount: Int
+    let options: CountOptions
+    let diagnostics: CountDiagnostics?
 }

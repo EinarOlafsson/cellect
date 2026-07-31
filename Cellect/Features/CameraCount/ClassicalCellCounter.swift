@@ -1,27 +1,40 @@
 import CoreGraphics
 import Foundation
 
-/// The always-available counting floor: Otsu threshold → 8-connected components → size stats.
+/// The always-available counting floor: median denoise → Otsu threshold → morphology →
+/// 8-connected components → size stats.
 /// Works on the CGImage as given (cap resolution upstream, as the segmentation flow does, so the
 /// returned label mask lines up with the image you save). No model, no network.
 ///
-/// Known limitation: touching cells that share a blob are counted as one. Watershed splitting via
-/// the distance transform is the planned next refinement (see docs/ARCHITECTURE.md §6b).
+/// Known limitation: touching cells that share a blob are counted as one.
 struct ClassicalCellCounter: CellCounter {
+    let identifier = "classical"
     let tier: CounterTier = .classical
-    let displayName = "Classical (Otsu + CCL)"
+    let displayName = "Classical CV (denoise + Otsu)"
 
     func count(in image: CGImage, options: CountOptions) async throws -> CountResult {
         let w = image.width, h = image.height
         guard w > 0, h > 0 else { throw CountError.decodeFailed }
-        let gray = try grayscale(image, width: w, height: h)
+        let sourceGray = try grayscale(image, width: w, height: h)
+        let gray = options.classicalDenoiseEnabled
+            ? median3x3(sourceGray, width: w, height: h)
+            : sourceGray
 
         // Otsu threshold, then binarize by polarity.
-        let t = otsuThreshold(gray)
+        let automaticThreshold = Int(otsuThreshold(gray))
+        let t = UInt8(
+            min(255, max(0, automaticThreshold + options.classicalThresholdOffset))
+        )
         var fg = [Bool](repeating: false, count: w * h)
         switch options.polarity {
         case .darkObjects:   for i in 0..<gray.count { fg[i] = gray[i] < t }
         case .brightObjects: for i in 0..<gray.count { fg[i] = gray[i] > t }
+        }
+        for _ in 0..<max(0, options.openingIterations) {
+            fg = open(fg, width: w, height: h)
+        }
+        for _ in 0..<max(0, options.closingIterations) {
+            fg = close(fg, width: w, height: h)
         }
 
         // Connected components (8-connectivity).
@@ -52,7 +65,10 @@ struct ClassicalCellCounter: CellCounter {
         var objects: [DetectedObject] = []
         var nextId = 0
         for l in 1...max(1, n) where l <= n {
-            guard area[l] >= options.minAreaPixels else { continue }
+            guard area[l] >= options.minAreaPixels,
+                  options.maxAreaPixels == 0 || area[l] <= options.maxAreaPixels else {
+                continue
+            }
             nextId += 1
             remap[l] = nextId
             let a = area[l]
@@ -119,6 +135,68 @@ struct ClassicalCellCounter: CellCounter {
             if between > best { best = between; threshold = i }
         }
         return UInt8(threshold)
+    }
+
+    /// A small median filter suppresses camera salt-and-pepper noise without blurring cell edges.
+    private func median3x3(_ pixels: [UInt8], width w: Int, height h: Int) -> [UInt8] {
+        guard w >= 3, h >= 3 else { return pixels }
+        var output = pixels
+        var values = [UInt8](repeating: 0, count: 9)
+        for y in 1..<(h - 1) {
+            for x in 1..<(w - 1) {
+                var n = 0
+                for dy in -1...1 {
+                    for dx in -1...1 {
+                        values[n] = pixels[(y + dy) * w + x + dx]
+                        n += 1
+                    }
+                }
+                values.sort()
+                output[y * w + x] = values[4]
+            }
+        }
+        return output
+    }
+
+    /// Opening removes isolated threshold noise; closing fills one-pixel gaps inside cell rims.
+    private func open(_ pixels: [Bool], width w: Int, height h: Int) -> [Bool] {
+        dilate(erode(pixels, width: w, height: h), width: w, height: h)
+    }
+
+    private func close(_ pixels: [Bool], width w: Int, height h: Int) -> [Bool] {
+        erode(dilate(pixels, width: w, height: h), width: w, height: h)
+    }
+
+    private func erode(_ pixels: [Bool], width w: Int, height h: Int) -> [Bool] {
+        guard w >= 3, h >= 3 else { return pixels }
+        var output = [Bool](repeating: false, count: pixels.count)
+        for y in 1..<(h - 1) {
+            for x in 1..<(w - 1) {
+                var keep = true
+                for dy in -1...1 {
+                    for dx in -1...1 where !pixels[(y + dy) * w + x + dx] {
+                        keep = false
+                    }
+                }
+                output[y * w + x] = keep
+            }
+        }
+        return output
+    }
+
+    private func dilate(_ pixels: [Bool], width w: Int, height h: Int) -> [Bool] {
+        guard w >= 3, h >= 3 else { return pixels }
+        var output = pixels
+        for y in 1..<(h - 1) {
+            for x in 1..<(w - 1) where !pixels[y * w + x] {
+                for dy in -1...1 {
+                    for dx in -1...1 where pixels[(y + dy) * w + x + dx] {
+                        output[y * w + x] = true
+                    }
+                }
+            }
+        }
+        return output
     }
 
     // MARK: - Connected components (two-pass union-find, 8-connectivity)

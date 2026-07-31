@@ -1,0 +1,6 @@
+.venv/
+data/
+output/
+__pycache__/
+permissioned_datasets/inbox/*
+!permissioned_datasets/inbox/README.md

@@ -1,0 +1,15 @@
+LIVECell development test fixtures
+
+Source: LIVECell — A large-scale dataset for label-free live cell segmentation
+Dataset site: https://sartorius-research.github.io/LIVECell/
+Mirror used for these ten fixtures: https://huggingface.co/datasets/mserna/livecell-hf
+License: CC BY-NC 4.0
+License text: https://creativecommons.org/licenses/by-nc/4.0/
+
+Edlund, C. et al. LIVECell—A large-scale dataset for label-free live cell
+segmentation. Nature Methods 18, 1038–1045 (2021).
+
+These files are JPEG development fixtures copied from the cited dataset mirror and
+renamed for stable in-app ordering; Cellect does not provide annotations for them.
+They are included for non-commercial development evaluation. Review the dataset
+license before distributing the application or derived model weights.

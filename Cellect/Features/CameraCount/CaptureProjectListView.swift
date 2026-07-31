@@ -26,6 +26,16 @@ struct CaptureProjectListView: View {
                 }
             }
             .onDelete { $0.map { store.projects[$0] }.forEach(store.delete) }
+
+            if let message = store.fixtureImportMessage {
+                Section {
+                    Label(message, systemImage: "photo.stack")
+                        .font(.footnote)
+                        .foregroundStyle(
+                            message.hasPrefix("Couldn't") ? Color.red : Color.secondary
+                        )
+                }
+            }
         }
         .navigationTitle("Camera Count")
         .toolbar {

@@ -8,6 +8,11 @@ struct CellectApp: App {
     @State private var segmentationStore = SegmentationStore()
     /// App-wide store of camera capture projects.
     @State private var captureStore = CaptureStore()
+    @AppStorage("cellect.appearance") private var appearanceRawValue = CellectAppearance.system.rawValue
+
+    private var preferredColorScheme: ColorScheme? {
+        (CellectAppearance(rawValue: appearanceRawValue) ?? .system).colorScheme
+    }
 
     var body: some Scene {
         WindowGroup {
@@ -15,7 +20,11 @@ struct CellectApp: App {
                 .environment(projectStore)
                 .environment(segmentationStore)
                 .environment(captureStore)
-                .tint(.accentColor)
+                .tint(CellectTheme.mint)
+                .preferredColorScheme(preferredColorScheme)
+                .task {
+                    await captureStore.installBundledTestImages()
+                }
         }
     }
 }
