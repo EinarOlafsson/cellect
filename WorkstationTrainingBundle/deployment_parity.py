@@ -153,10 +153,16 @@ def verify_deployment_artifacts(
         )
     callback = postprocess_callback or reconstruct_iphone_instances
     config_payload = _config_payload(postprocess_config)
-    model = model.eval().to(device)
-    # Keep only the eager model on CUDA.  Loading a second large SegFormer as TorchScript on the
-    # RTX 3090 can exceed memory even though inference for either artifact fits independently.
+    # Loading a second large SegFormer as TorchScript beside the eager model on the RTX 3090 can
+    # exceed memory even though inference for either artifact fits independently.
     traced = torch.jit.load(str(torchscript_path), map_location="cpu").eval()
+    # The export comparison below runs the eager model on the CPU as well.  CUDA and CPU kernels
+    # for the same weights disagree by ~0.4% of the logit scale on this hardware, which is device
+    # arithmetic rather than export error and would swamp a 1e-3 tolerance meant to detect a wrong
+    # export.  Comparing all three on one device isolates artifact fidelity, and the CPU path is
+    # also the closer analogue of the on-device deployment target.
+    reference_device = torch.device("cpu")
+    model = model.eval().to(reference_device)
     session = ort.InferenceSession(
         str(onnx_path),
         providers=["CPUExecutionProvider"],
@@ -170,8 +176,7 @@ def verify_deployment_artifacts(
         if image is None:
             raise RuntimeError(f"Could not decode deployment parity image {path}")
         tensor_cpu = deployment_tensor(image, image_size)
-        tensor_device = tensor_cpu.to(device)
-        eager = model(tensor_device).float().cpu().numpy()
+        eager = model(tensor_cpu).float().cpu().numpy()
         torchscript = traced(tensor_cpu).float().cpu().numpy()
         onnx = session.run(None, {session.get_inputs()[0].name: tensor_cpu.numpy()})[0]
         expected_shape = (1, 2, image_size, image_size)
@@ -233,7 +238,7 @@ def verify_deployment_artifacts(
         (image_size + 73, image_size + 17),
         interpolation=cv2.INTER_LINEAR,
     )
-    whole_frame_tensor = deployment_tensor(seam_image, image_size).to(device)
+    whole_frame_tensor = deployment_tensor(seam_image, image_size).to(reference_device)
     whole_frame_logits = model(whole_frame_tensor).float().cpu().numpy()
     expected_whole_frame_shape = (1, 2, image_size, image_size)
     if whole_frame_logits.shape != expected_whole_frame_shape:
@@ -246,7 +251,7 @@ def verify_deployment_artifacts(
         model,
         seam_image,
         tile_size=image_size,
-        device=device,
+        device=reference_device,
         overlap_fraction=0.25,
         tile_batch_size=1,
     )
@@ -332,6 +337,9 @@ def verify_deployment_artifacts(
         "schema_version": 4,
         "bundle_version": BUNDLE_VERSION,
         "parity_version": PARITY_VERSION,
+        # Eager reference, TorchScript and ONNX are all evaluated on this device, so the recorded
+        # errors measure export fidelity rather than CUDA-versus-CPU arithmetic.
+        "reference_device": str(reference_device),
         "postprocess_contract": POSTPROCESS_VERSION,
         "tiled_inference_contract": TILED_INFERENCE_VERSION,
         "input_contract": {

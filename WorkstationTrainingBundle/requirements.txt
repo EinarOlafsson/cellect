@@ -10,9 +10,12 @@ scipy==1.15.3
 scikit-image==0.24.0
 pandas==2.3.1
 Pillow==11.3.0
+tifffile==2024.9.20
 tqdm==4.67.1
 gdown==5.2.0
 onnx==1.18.0
 onnxruntime-gpu==1.22.0
+coremltools==9.0
 cellpose==4.2.1.1
 dinov3 @ git+https://github.com/facebookresearch/dinov3.git@6876159a11b4df116f30f667f8c9888617df0751
+trackastra @ git+https://github.com/weigertlab/trackastra.git@f5b5e338ab7b7d3da3c56ea4e5ecd2830fed89eb

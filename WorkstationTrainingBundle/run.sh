@@ -43,7 +43,7 @@ fi
 echo
 if [[ "$MODE" == "preflight" ]]; then
   echo "Preflight finished. Review:"
-  echo "$SCRIPT_DIR/output/preflight_v3.json"
+  echo "$SCRIPT_DIR/output/preflight_v4.json"
 else
   echo "Finished. Copy this file back to the Mac:"
   echo "$SCRIPT_DIR/output/cellect_workstation_results.zip"

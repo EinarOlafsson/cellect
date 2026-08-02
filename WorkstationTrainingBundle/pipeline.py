@@ -46,6 +46,7 @@ from deployment_runtime import (
 from mask_targets import BOUNDARY_TARGET_VERSION, internal_contact_boundary
 from scientific_splits import (
     BUNDLE_VERSION,
+    SPLIT_PROTOCOL_VERSION,
     livecell_role,
     validation_role,
 )
@@ -581,9 +582,12 @@ class LiveCellDataset(Dataset):
             "mask": mask_tensor,
             "instances": instance_tensor,
             "count": count,
+            # Every dataset in a modality-balanced batch has to expose the same keys or the
+            # default collate fails as soon as LIVECell and an external source land together.
+            # The upstream split stays visible through ``name``; the LIVECell COCO records used
+            # for scoring carry their own ``coco_source`` and are built separately.
             "name": f"{source_key}_{Path(file_name).name}",
             "dataset": "livecell",
-            "coco_source": source_key,
         }
 
 
@@ -1137,16 +1141,15 @@ def train_model(
             checkpoint = torch.load(previous_path, map_location="cpu", weights_only=False)
         if checkpoint.get("stage_fingerprint") != stage_fingerprint:
             raise RuntimeError(
-                f"Refusing to resume {spec.name}: checkpoint fingerprint does not match v3 run"
+                f"Refusing to resume {spec.name}: checkpoint fingerprint does not match v4 run"
             )
         model.load_state_dict(checkpoint["model"])
         try:
             optimizer.load_state_dict(checkpoint["optimizer"])
-        except ValueError:
-            print(
-                f"Optimizer layout changed for {spec.name}; "
-                "resuming weights with fresh optimizer state."
-            )
+        except (KeyError, ValueError) as error:
+            raise RuntimeError(
+                f"Refusing partial resume for {spec.name}: optimizer state is incompatible"
+            ) from error
         if "scheduler" in checkpoint:
             scheduler.load_state_dict(checkpoint["scheduler"])
         if "scaler" in checkpoint:
@@ -1639,7 +1642,7 @@ def tune_postprocessing_records(
             "mean_foreground_probability": "mean, not sum, to avoid favoring large cells",
             "core_fraction": "fraction of object pixels with foreground probability >= 0.70",
             "boundary_support": (
-                "supported by the app but excluded from v3 automatic selection because the "
+                "supported by the app but excluded from v4 automatic selection because the "
                 "boundary head predicts internal contacts, not ordinary outer perimeters"
             ),
         },
@@ -1895,7 +1898,7 @@ def coco_instance_mask(coco: COCO, image_id: int, size: int) -> np.ndarray:
     ).astype(np.int32)
 
 
-ENSEMBLE_EVALUATOR_VERSION = "disk-stream-role-separated-deployment-grid-v3"
+ENSEMBLE_EVALUATOR_VERSION = "disk-stream-role-separated-deployment-grid-v4"
 
 
 @torch.inference_mode()
@@ -2136,7 +2139,7 @@ def tune_postprocessing_streaming(
                 "fraction of object pixels with foreground probability >= 0.70"
             ),
             "boundary_support": (
-                "available as a research diagnostic but excluded from v3 auto-selection"
+                "available as a research diagnostic but excluded from v4 auto-selection"
             ),
         },
         "validation_images": record_count,
@@ -2307,9 +2310,10 @@ def evaluate_all_ensembles(
         spec.name: sha256(checkpoints[spec.name]) for spec in specs
     }
     cache_core: dict[str, object] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "evaluator_version": ENSEMBLE_EVALUATOR_VERSION,
         "experiment_fingerprint": experiment_fingerprint,
+        "split_protocol_version": SPLIT_PROTOCOL_VERSION,
         "roles": list(validation_roles),
         "common_size": common_size,
         "model_specs": [asdict(spec) for spec in specs],
@@ -2737,7 +2741,7 @@ def evaluate_all_ensembles(
             }
         )
     result = {
-        "schema_version": 3,
+        "schema_version": 4,
         "evaluator_version": ENSEMBLE_EVALUATOR_VERSION,
         "role": "ensemble_selection",
         "method": (
@@ -2806,7 +2810,7 @@ def evaluate_all_ensembles(
             "ensemble_selection_evaluation"
         ]["selection_score"],
         "held_out_test_status": (
-            "labels sealed and unparsed; run only after deployment_lock_v3.json is written"
+            "labels sealed and unparsed; run only after deployment_lock_v4.json is written"
         ),
     }
     atomic_json_save(destination, result)
@@ -2824,10 +2828,21 @@ def sha256(path: Path) -> str:
 def experiment_fingerprint(dataset_fingerprint: str, mode_family: str) -> str:
     digest = hashlib.sha256()
     digest.update(BUNDLE_VERSION.encode())
+    digest.update(SPLIT_PROTOCOL_VERSION.encode())
     digest.update(dataset_fingerprint.encode())
     digest.update(mode_family.encode())
-    for path in sorted(ROOT.glob("*.py")) + [ROOT / "requirements.txt", ROOT / "run.sh"]:
-        digest.update(path.name.encode())
+    source_paths = [
+        path
+        for path in ROOT.rglob("*.py")
+        if not any(part in {".venv", "data", "output", "__pycache__"} for part in path.parts)
+    ]
+    source_paths.extend(
+        path
+        for path in (ROOT / "requirements.txt", ROOT / "run.sh")
+        if path.is_file()
+    )
+    for path in sorted(source_paths, key=lambda item: str(item.relative_to(ROOT))):
+        digest.update(str(path.relative_to(ROOT)).encode())
         digest.update(sha256(path).encode())
     return digest.hexdigest()
 
@@ -3116,6 +3131,8 @@ def package_results(summary: dict[str, object], best_model: str) -> Path:
     (result_root / "README.txt").write_text(
         "Copy this entire ZIP to cellect/WorkstationResults/inbox/ on the Mac.\n"
         f"Automatically selected model: {best_model}\n"
+        "coreml_artifacts/ contains Linux-preconverted packages plus hash-bound golden "
+        "fixtures; validate them with WorkstationResults/convert_coreml.py on the Mac.\n"
     )
     for spec in ALL_MODEL_SPECS:
         source = RUNS / spec.name
@@ -3140,7 +3157,7 @@ def package_results(summary: dict[str, object], best_model: str) -> Path:
                 target / "deployment_parity",
             )
     for base_model in FOUNDATION_MODELS:
-        foundation_run_name = f"{base_model}_eukaryotic_v3_finetuned"
+        foundation_run_name = f"{base_model}_eukaryotic_v4_finetuned"
         foundation_source = RUNS / foundation_run_name
         if foundation_source.exists():
             foundation_target = result_root / foundation_run_name
@@ -3150,25 +3167,102 @@ def package_results(summary: dict[str, object], best_model: str) -> Path:
                 "history.csv",
                 "training.log",
                 "completed.json",
+                "training_contract.json",
+                "ram_preflight.json",
+                "flow_cache_train_manifest.json",
+                "flow_cache_checkpoint_manifest.json",
                 "checkpoint_selection.json",
                 "inference_search.json",
                 "val_evaluation.json",
-                "calibration_evaluation_tuned_v3.json",
+                "calibration_evaluation_tuned_v4.json",
             ):
                 source_path = foundation_source / name
                 if source_path.is_file():
                     shutil.copy2(source_path, foundation_target / name)
+    shape_source = RUNS / "cellect_v4_shape"
+    if shape_source.is_dir():
+        # Keep paper-facing histories, frozen weights, calibration/search reports, and deployable
+        # exports.  Optimizer-resume files and per-image probability caches remain on the
+        # workstation because they can be regenerated and would make the return ZIP enormous.
+        shutil.copytree(
+            shape_source,
+            result_root / "cellect_v4_shape",
+            ignore=shutil.ignore_patterns(
+                "last.pt",
+                "*.prev",
+                "five_channel_cache",
+                "truth_cache",
+            ),
+        )
+    tracking_summary = summary.get("cellect_track")
+    if isinstance(tracking_summary, dict):
+        tracking_experiment = Path(
+            str(tracking_summary["experiment_directory"])
+        ).resolve()
+        tracking_root = (OUTPUT / "cellect_track_v4").resolve()
+        if not tracking_experiment.is_relative_to(tracking_root):
+            raise RuntimeError(
+                "CellectTrack summary points outside its scoped output root: "
+                f"{tracking_experiment}"
+            )
+        if not tracking_experiment.is_dir():
+            raise RuntimeError(
+                f"CellectTrack result directory is missing: {tracking_experiment}"
+            )
+        tracking_target = result_root / "cellect_track_v4"
+        shutil.copytree(
+            tracking_experiment,
+            tracking_target,
+            # Histories are embedded in the summary. Keep frozen deployment state/exports but
+            # leave optimizer-resume checkpoints on the workstation.
+            ignore=shutil.ignore_patterns("stages"),
+        )
+        for name in (
+            "tracking_preflight_v4.json",
+            "tracking_feature_normalization_v4.json",
+            "tracking_best_smoke_pass_v4.json",
+        ):
+            source_path = tracking_root / name
+            if source_path.is_file():
+                shutil.copy2(source_path, tracking_target / name)
     ensemble_report = RUNS / "ensemble_evaluation.json"
     if ensemble_report.is_file():
         shutil.copy2(ensemble_report, result_root / ensemble_report.name)
-    for name in ("deployment_lock_v3.json",):
+    for name in ("deployment_lock_v4.json",):
         source_path = RUNS / name
         if source_path.is_file():
             shutil.copy2(source_path, result_root / name)
-    for name in ("preflight_v3.json", "splits_v3.jsonl"):
+    for name in (
+        "preflight_v4.json",
+        "splits_v4.jsonl",
+        "tracking_preflight_v4.json",
+        "tracking_splits_v4.jsonl",
+    ):
         source_path = OUTPUT / name
         if source_path.is_file():
             shutil.copy2(source_path, result_root / name)
+    if summary.get("mode") in {"best-smoke", "best"}:
+        # PyTorch 2.7 TorchScript cannot be deserialized by the last Intel-macOS
+        # PyTorch wheels. Convert every returned segmentation/tracking candidate
+        # here, while the exact training runtime is still available. Linux never
+        # invokes MLModel.predict; portable hash-bound golden fixtures allow the
+        # Mac to perform native Core ML parity without importing PyTorch.
+        artifact_root = result_root / "coreml_artifacts"
+        subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "coreml_bridge.py"),
+                "--conversion-only",
+                "--source-root",
+                str(result_root),
+                "--artifact-root",
+                str(artifact_root),
+                "--benchmark-runs",
+                "1",
+            ],
+            cwd=ROOT,
+            check=True,
+        )
     checksums = []
     for path in sorted(result_root.rglob("*")):
         if path.is_file():
@@ -3179,6 +3273,23 @@ def package_results(summary: dict[str, object], best_model: str) -> Path:
         destination.unlink()
     shutil.make_archive(str(destination.with_suffix("")), "zip", result_root)
     return destination
+
+
+def resolve_skip_tracking() -> bool:
+    """Whether this run trains segmentation only, leaving CellectTrack for a later run.
+
+    Tracking has its own data contract, its own preflight and its own PASS marker, so it can be
+    trained separately.  Skipping it is recorded in the dataset fingerprint, which means a
+    segmentation-only marker can never authorize a run that includes tracking, or the reverse.
+    """
+    configured = os.environ.get("CELLECT_SKIP_TRACKING", "").strip().casefold()
+    if configured in {"", "0", "false", "no", "off"}:
+        return False
+    if configured in {"1", "true", "yes", "on"}:
+        return True
+    raise ValueError(
+        f"CELLECT_SKIP_TRACKING must be a boolean flag, not {configured!r}"
+    )
 
 
 def main() -> None:
@@ -3237,6 +3348,7 @@ def main() -> None:
             DATASET_MANIFEST,
             GATED_DATASET_MANIFEST,
             OPTIONAL_SPECIALIST_DATASET_MANIFEST,
+            find_local_deepsea_root,
             prepare_external_datasets,
         )
 
@@ -3247,12 +3359,302 @@ def main() -> None:
             ANNOTATIONS,
             IMAGES_ROOT,
             external_samples,
-            OUTPUT / "preflight_v3.json",
+            OUTPUT / "preflight_v4.json",
         )
-        dataset_fingerprint = str(preflight_report["dataset_fingerprint_sha256"])
+        # The preflight is the only component that decodes every label, so it is also where
+        # cell-free development frames are identified.  Drop them here so the split manifest and
+        # the training sample list describe exactly the same data.
+        withheld_image_paths = {
+            str(row["image_path"])
+            for row in preflight_report.get("withheld_development_samples", [])
+        }
+        if withheld_image_paths:
+            external_samples = [
+                sample
+                for sample in external_samples
+                if str(sample.image_path) not in withheld_image_paths
+            ]
+            print(
+                f"Withheld {len(withheld_image_paths)} development frame(s) without any "
+                "annotated cell from external training data."
+            )
+        # Tracking data is part of the same preregistered experiment identity.  Strict adapters
+        # read only DeepSea train, CTC training TRA, LiveCellTrack public-preview human MOT,
+        # CTMC-v1 TRAIN, and ALFI Task-1 ground truth. Official test labels and detector outputs are never searched. Hash every
+        # acquisition before either the smoke gate or long training starts.
+        skip_tracking = resolve_skip_tracking()
+        from tracking_data import (
+            ALFI_ARCHIVE_BYTES,
+            ALFI_ARCHIVE_MD5,
+            ALFI_DOI,
+            ALFI_EXPECTED,
+            ALFI_FILE_ID,
+            ALFI_LICENSE,
+            ALFI_URL,
+            CTC_TRACKING_DATASETS,
+            CTMC_V1_EXPECTED,
+            CTMC_V1_LICENSE,
+            CTMC_V1_URL,
+            LIVECELLTRACK_PREVIEW_ARCHIVE_BYTES,
+            LIVECELLTRACK_PREVIEW_ARCHIVE_SHA256,
+            LIVECELLTRACK_PREVIEW_DOI,
+            LIVECELLTRACK_PREVIEW_LICENSE,
+            LIVECELLTRACK_SOURCE_FORMAT,
+            TRACKING_ROLES,
+            deepsea_irregular_sequences,
+            discover_transmitted_light_tracking,
+            prepare_alfi_task1,
+            prepare_ctmc_v1,
+            prepare_livecelltrack_preview,
+            resolve_omitted_tracking_sources,
+            tracking_summary,
+        )
+
+        if skip_tracking:
+            # Tracking has its own contract, preflight and PASS marker, so a segmentation-only
+            # run is coherent on its own.  The dataset fingerprint records the skip, so this
+            # run's marker cannot authorize one that includes tracking, or the reverse.
+            print(
+                "CellectTrack is skipped by request (CELLECT_SKIP_TRACKING). This run trains "
+                "and exports segmentation only; its marker cannot authorize a tracking run."
+            )
+            tracking_dataset_fingerprint = "skipped"
+            tracking_preflight = {
+                "status": "SKIPPED",
+                "reason": "CELLECT_SKIP_TRACKING selected a segmentation-only run",
+                "official_test_labels_parsed": False,
+            }
+            deepsea_tracking_root = None
+            ctc_tracking_roots = {}
+            livecelltrack_tracking_root = None
+            ctmc_tracking_root = None
+            alfi_tracking_root = None
+        else:
+            local_deepsea = find_local_deepsea_root()
+            if local_deepsea is None:
+                raise RuntimeError(
+                    "The complete DeepSea root is required for CellectTrack preflight"
+                )
+            deepsea_tracking_root = local_deepsea[0]
+            ctc_tracking_roots = {
+                dataset: DATA / "external" / dataset
+                for dataset in CTC_TRACKING_DATASETS
+            }
+            omitted_tracking_sources = resolve_omitted_tracking_sources()
+            if omitted_tracking_sources:
+                print(
+                    "CellectTrack data contract reduced by request: omitting "
+                    + ", ".join(sorted(omitted_tracking_sources))
+                    + ". The tracking fingerprint records the omission, so this run is not "
+                    "comparable to a full-contract run and its marker cannot authorize one."
+                )
+            configured_livecelltrack_root = os.environ.get("CELLECT_LIVECELLTRACK_ROOT")
+            if "livecelltrack_preview" in omitted_tracking_sources:
+                livecelltrack_tracking_root = None
+            elif configured_livecelltrack_root:
+                livecelltrack_tracking_root = (
+                    Path(configured_livecelltrack_root).expanduser().resolve()
+                )
+            else:
+                livecelltrack_tracking_root = prepare_livecelltrack_preview(
+                    DATA, allow_network=True
+                )
+            ctmc_tracking_root = (
+                None
+                if "ctmc_v1" in omitted_tracking_sources
+                else prepare_ctmc_v1(DATA, allow_network=True)
+            )
+            alfi_tracking_root = (
+                None
+                if "alfi_task1" in omitted_tracking_sources
+                else prepare_alfi_task1(DATA, allow_network=True)
+            )
+            tracking_sequences = discover_transmitted_light_tracking(
+                deepsea_root=deepsea_tracking_root,
+                ctc_roots=ctc_tracking_roots,
+                livecelltrack_root=livecelltrack_tracking_root,
+                ctmc_root=ctmc_tracking_root,
+                alfi_root=alfi_tracking_root,
+            )
+            tracking_rows = [
+                {
+                    "dataset": sequence.dataset,
+                    "sequence_id": sequence.sequence_id,
+                    "acquisition_group": sequence.acquisition_group,
+                    "role": sequence.role,
+                    "modality": sequence.modality,
+                    "organism": sequence.organism,
+                    "source_format": sequence.source_format,
+                    "source_partition": sequence.source_partition,
+                    "frame_count": sequence.frame_count,
+                    "track_count": len(sequence.tracks),
+                    "parent_link_count": len(sequence.parent_links),
+                    "division_lineage_available": (
+                        sequence.source_format != LIVECELLTRACK_SOURCE_FORMAT
+                    ),
+                    "annotation_exclusions": [
+                        asdict(exclusion)
+                        for exclusion in sequence.annotation_exclusions
+                    ],
+                    "source_file_exclusions": [
+                        asdict(exclusion)
+                        for exclusion in sequence.source_file_exclusions
+                    ],
+                    "division_quarantined_parent_track_ids": list(
+                        sequence.division_quarantined_parent_track_ids
+                    ),
+                    "event_quarantined_track_frames": [
+                        list(value) for value in sequence.event_quarantined_track_frames
+                    ],
+                    "unlabeled_mask_regions": [
+                        asdict(region) for region in sequence.unlabeled_mask_regions
+                    ],
+                    "sequence_fingerprint_sha256": sequence.sequence_fingerprint_sha256,
+                }
+                for sequence in tracking_sequences
+            ]
+            tracking_role_counts = {
+                role: sum(sequence.role == role for sequence in tracking_sequences)
+                for role in TRACKING_ROLES
+            }
+            empty_tracking_roles = [
+                role for role, count in tracking_role_counts.items() if count == 0
+            ]
+            if empty_tracking_roles:
+                raise RuntimeError(
+                    "Tracking acquisition split has empty roles: "
+                    + ", ".join(empty_tracking_roles)
+                )
+            tracking_split_path = OUTPUT / "tracking_splits_v4.jsonl"
+            tracking_split_temporary = tracking_split_path.with_suffix(".jsonl.tmp")
+            tracking_split_temporary.write_text(
+                "".join(
+                    json.dumps(row, sort_keys=True, allow_nan=False) + "\n"
+                    for row in tracking_rows
+                )
+            )
+            tracking_split_temporary.replace(tracking_split_path)
+            # Fingerprint the exact bytes that are retained and returned for paper audit.  A digest
+            # of an equivalent in-memory JSON array would not validate the JSONL artifact itself.
+            tracking_split_sha256 = sha256(tracking_split_path)
+            tracking_fingerprint_inputs: dict[str, object] = {
+                "sequences": [row["sequence_fingerprint_sha256"] for row in tracking_rows],
+                "split_manifest_sha256": tracking_split_sha256,
+            }
+            if omitted_tracking_sources:
+                # Only present when a source was omitted, so a full-contract run keeps the identity it
+                # would have had, while a reduced run can never be mistaken for one.
+                tracking_fingerprint_inputs["omitted_sources"] = sorted(
+                    omitted_tracking_sources
+                )
+            tracking_dataset_fingerprint = hashlib.sha256(
+                json.dumps(
+                    tracking_fingerprint_inputs,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            tracking_preflight = {
+                "schema_version": 4,
+                "status": "PASS",
+                "dataset_fingerprint_sha256": tracking_dataset_fingerprint,
+                "split_manifest": str(tracking_split_path),
+                "split_manifest_sha256": tracking_split_sha256,
+                "roles": tracking_role_counts,
+                "summary": tracking_summary(tracking_sequences),
+                "omitted_sources": sorted(omitted_tracking_sources),
+                "omitted_sources_note": (
+                    "Operator-requested omissions via CELLECT_OMIT_TRACKING_SOURCES. A run with a "
+                    "non-empty list trained on a reduced tracking contract; its metrics are not "
+                    "comparable to a full-contract run and its fingerprint differs accordingly."
+                ),
+                "sources": {
+                    "deepsea": {
+                        "root": str(deepsea_tracking_root),
+                        "irregular_sequences": [
+                            {"sequence_id": sequence_id, "reason": reason}
+                            for sequence_id, reason in deepsea_irregular_sequences(
+                                deepsea_tracking_root
+                            )
+                        ],
+                    },
+                    "ctc": {
+                        dataset: str(path)
+                        for dataset, path in ctc_tracking_roots.items()
+                    },
+                    "livecelltrack_preview": {
+                        "root": (
+                            None
+                            if livecelltrack_tracking_root is None
+                            else str(livecelltrack_tracking_root)
+                        ),
+                        "doi": LIVECELLTRACK_PREVIEW_DOI,
+                        "license": LIVECELLTRACK_PREVIEW_LICENSE,
+                        "archive_bytes": LIVECELLTRACK_PREVIEW_ARCHIVE_BYTES,
+                        "archive_sha256": LIVECELLTRACK_PREVIEW_ARCHIVE_SHA256,
+                        "annotation_contract": (
+                            "human MOT identity boxes; no parent/division or explicit positive "
+                            "birth/death annotations"
+                        ),
+                    },
+                    "ctmc_v1": {
+                        "root": (
+                            None if ctmc_tracking_root is None else str(ctmc_tracking_root)
+                        ),
+                        "url": CTMC_V1_URL,
+                        "expected_train_totals": dict(CTMC_V1_EXPECTED),
+                        "license": CTMC_V1_LICENSE,
+                        "partition": "official train only; test not extracted or parsed",
+                        "bbox_proxy": "generated in memory on demand",
+                    },
+                    "alfi_task1": {
+                        "root": (
+                            None if alfi_tracking_root is None else str(alfi_tracking_root)
+                        ),
+                        "doi": ALFI_DOI,
+                        "file_id": ALFI_FILE_ID,
+                        "url": ALFI_URL,
+                        "archive_bytes": ALFI_ARCHIVE_BYTES,
+                        "archive_md5": ALFI_ARCHIVE_MD5,
+                        "expected": dict(ALFI_EXPECTED),
+                        "license": ALFI_LICENSE,
+                        "scope": "MI01-MI08 Images + DTLTruth only; Task2 and masks excluded",
+                        "bbox_proxy": "generated in memory on demand",
+                    },
+                },
+                "birth_death_policy": (
+                    "all admitted source endpoints are censored; no positive biological event is "
+                    "invented and decoder birth/death gates remain disabled"
+                ),
+                "official_test_labels_parsed": False,
+                "records": tracking_rows,
+            }
+            atomic_json_save(OUTPUT / "tracking_preflight_v4.json", tracking_preflight)
+        segmentation_dataset_fingerprint = str(
+            preflight_report["dataset_fingerprint_sha256"]
+        )
+        dataset_fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "segmentation": segmentation_dataset_fingerprint,
+                    "tracking": tracking_dataset_fingerprint,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        preflight_report["segmentation_dataset_fingerprint_sha256"] = (
+            segmentation_dataset_fingerprint
+        )
+        preflight_report["tracking_dataset_fingerprint_sha256"] = (
+            tracking_dataset_fingerprint
+        )
+        preflight_report["tracking_preflight"] = tracking_preflight
+        preflight_report["dataset_fingerprint_sha256"] = dataset_fingerprint
+        atomic_json_save(OUTPUT / "preflight_v4.json", preflight_report)
         stage_fingerprint = experiment_fingerprint(
             dataset_fingerprint,
-            "best-v3",
+            "best-v4",
         )
         if args.mode == "preflight":
             print(json.dumps(preflight_report, indent=2))
@@ -3260,7 +3662,7 @@ def main() -> None:
         experiment_kind = "best-smoke" if best_smoke else "best"
         RUNS = OUTPUT / "experiments" / experiment_kind / stage_fingerprint[:16] / "runs"
         if args.mode == "best":
-            smoke_marker = OUTPUT / "best_smoke_pass_v3.json"
+            smoke_marker = OUTPUT / "best_smoke_pass_v4.json"
             if not smoke_marker.is_file():
                 raise RuntimeError(
                     "Run ./run.sh best-smoke successfully before starting ./run.sh best."
@@ -3272,7 +3674,7 @@ def main() -> None:
                 or marker.get("stage_fingerprint") != stage_fingerprint
             ):
                 raise RuntimeError(
-                    "The best-smoke PASS marker does not match this v3 code/data fingerprint; "
+                    "The best-smoke PASS marker does not match this v4 code/data fingerprint; "
                     "rerun ./run.sh best-smoke."
                 )
         split_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -3291,8 +3693,9 @@ def main() -> None:
         stage_fingerprint = experiment_fingerprint("livecell-only", args.mode)
         RUNS = OUTPUT / "experiments" / args.mode / stage_fingerprint[:16] / "runs"
     summary: dict[str, object] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "bundle_version": BUNDLE_VERSION,
+        "split_protocol_version": SPLIT_PROTOCOL_VERSION,
         "experiment_fingerprint": stage_fingerprint,
         "mode": args.mode,
         "environment": environment_report(),
@@ -3351,12 +3754,28 @@ def main() -> None:
     }
     if accuracy_mode:
         summary["data_preflight"] = {
-            "report": str((OUTPUT / "preflight_v3.json").relative_to(ROOT)),
+            "report": str((OUTPUT / "preflight_v4.json").relative_to(ROOT)),
             "dataset_fingerprint_sha256": preflight_report[
                 "dataset_fingerprint_sha256"
             ],
+            "segmentation_dataset_fingerprint_sha256": preflight_report[
+                "segmentation_dataset_fingerprint_sha256"
+            ],
+            "tracking_dataset_fingerprint_sha256": preflight_report[
+                "tracking_dataset_fingerprint_sha256"
+            ],
             "split_manifest": preflight_report["split_manifest"],
             "split_manifest_sha256": preflight_report["split_manifest_sha256"],
+            "tracking_split_manifest": (
+                None
+                if skip_tracking
+                else str((OUTPUT / "tracking_splits_v4.jsonl").relative_to(ROOT))
+            ),
+            "tracking_split_manifest_sha256": preflight_report["tracking_preflight"].get(
+                "split_manifest_sha256"
+            ),
+            "tracking_summary": preflight_report["tracking_preflight"].get("summary"),
+            "tracking_skipped": skip_tracking,
             "status": preflight_report["status"],
         }
     if accuracy_mode:
@@ -3365,7 +3784,7 @@ def main() -> None:
         # Version the materialized directory so an interrupted older run that included bacterial
         # or uncapped yeast images cannot silently contaminate this eukaryotic profile.
         cellpose_data_root = DATA / (
-            f"cellpose_v3_{'smoke' if best_smoke else 'best'}_"
+            f"cellpose_v4_{'smoke' if best_smoke else 'best'}_"
             f"{stage_fingerprint[:12]}"
         )
         livecell_cellpose_counts = materialize_livecell_for_cellpose(
@@ -3379,7 +3798,7 @@ def main() -> None:
         )
         summary["foundation_models"] = {}
         for base_model in FOUNDATION_MODELS:
-            foundation_output = RUNS / f"{base_model}_eukaryotic_v3_finetuned"
+            foundation_output = RUNS / f"{base_model}_eukaryotic_v4_finetuned"
             subprocess.run(
                 [
                     sys.executable,
@@ -3409,7 +3828,7 @@ def main() -> None:
             selected_cellprob = float(selected_inference["cellprob_threshold"])
             selected_flow = float(selected_inference["flow_threshold"])
             calibration_evaluation_path = (
-                foundation_output / "calibration_evaluation_tuned_v3.json"
+                foundation_output / "calibration_evaluation_tuned_v4.json"
             )
             selected_validation_path = foundation_output / selected_inference[
                 "evaluation"
@@ -3425,6 +3844,11 @@ def main() -> None:
                     "tile_size": 384 if base_model.startswith("cpdino") else 256,
                     "minimum_masks_per_image": 1,
                     "snapshot_interval": 25,
+                    "file_streaming": (
+                        "serial verified shared flow cache; one image/flow pair loaded per step"
+                    ),
+                    "stateful_resume_interval": 5,
+                    "resume_state": "model + AdamW + LR epoch + histories + all RNG states",
                 },
                 "checkpoint_selection": checkpoint_selection,
                 "inference_search": inference_search,
@@ -3692,6 +4116,91 @@ def main() -> None:
             finalist_count=2 if best_smoke else 16,
             role_limit_per_domain=1 if best_smoke else None,
         )
+        # Cellect v4 retains the compatible semantic backbones above, then learns three
+        # independently deployable boundary mechanisms: local image context, Cellpose-style
+        # center-directed flows, and whole-cell shape/affinity.  The pinned foundation model is
+        # used only as a leakage-safe teacher.  Its predictions are materialized serially before
+        # DataLoader workers start, after which the GPU teacher is released.
+        from cellpose_teacher import (
+            PINNED_CELLPOSE_MODELS,
+            TeacherInferenceSettings,
+            TeacherProvenance,
+            ensure_pinned_model_file,
+            instantiate_strict_cellpose_model,
+        )
+        from v4_shape_training import CellposeTeacherSource, run_v4_shape_training
+
+        teacher_name = "cpsam_v2"
+        teacher_weights, teacher_weights_report = ensure_pinned_model_file(
+            DATA / "pinned_cellpose_weights",
+            teacher_name,
+        )
+        teacher_model, teacher_initialization_report = instantiate_strict_cellpose_model(
+            teacher_weights,
+            teacher_name,
+            device=device,
+            expected_sha256=PINNED_CELLPOSE_MODELS[teacher_name].sha256,
+            use_bfloat16=True,
+        )
+        teacher_provenance = TeacherProvenance.pinned_foundation(teacher_name)
+        cellpose_teacher_source = CellposeTeacherSource(
+            cache_root=DATA / "teacher_cache_v4" / stage_fingerprint[:16],
+            settings=TeacherInferenceSettings.for_model(
+                teacher_name,
+                tile_overlap=0.25,
+                tile_batch_size=1,
+                model_precision="bfloat16",
+            ),
+            validation_provenance=teacher_provenance,
+            models_by_checkpoint_sha256={
+                teacher_provenance.checkpoint_sha256: teacher_model
+            },
+            generate_missing=True,
+        )
+        # The source owns the final reference until its serial cache preflight clears the model.
+        del teacher_model
+        cellect_v4_manifest = run_v4_shape_training(
+            cellpose_data_root,
+            RUNS / "cellect_v4_shape",
+            stage_fingerprint=stage_fingerprint,
+            split_manifest_sha256=str(preflight_report["split_manifest_sha256"]),
+            mode="smoke" if best_smoke else "full",
+            v3_checkpoints=semantic_checkpoints,
+            cellpose_teacher_source=cellpose_teacher_source,
+            device=device,
+        )
+        summary["cellect_v4"] = {
+            **cellect_v4_manifest,
+            "teacher_weights_verification": teacher_weights_report,
+            "teacher_strict_initialization": teacher_initialization_report,
+        }
+        # Tracking is intentionally a separate model: it consumes Cellect instance detections
+        # across time, learns associations/divisions/birth/death/uncertainty, and can therefore be
+        # replaced or calibrated without changing the segmentation mask itself.  Distill the
+        # verified Trackastra general_2d teacher only on our transmitted-light training roles.
+        from tracking_models import download_trackastra_teacher
+        from v4_tracking_training import run_v4_tracking_training
+
+        trackastra_teacher_directory = None if skip_tracking else download_trackastra_teacher(
+            DATA / "trackastra_teacher_v4",
+            allow_network=True,
+            timeout_seconds=300.0,
+        )
+        cellect_track_summary = None if skip_tracking else run_v4_tracking_training(
+            data_root=DATA,
+            output_root=OUTPUT / "cellect_track_v4",
+            mode=args.mode,
+            deepsea_root=deepsea_tracking_root,
+            ctc_roots=ctc_tracking_roots,
+            livecelltrack_root=livecelltrack_tracking_root,
+            ctmc_root=ctmc_tracking_root,
+            alfi_root=alfi_tracking_root,
+            teacher_directory=trackastra_teacher_directory,
+            device=device,
+        )
+        if cellect_track_summary is not None:
+            summary["cellect_track"] = cellect_track_summary
+        summary["cellect_track_skipped"] = skip_tracking
     best_model = max(
         summary["models"],
         key=lambda name: summary["models"][name]["ensemble_selection_score"],
@@ -3700,8 +4209,9 @@ def main() -> None:
     if accuracy_mode:
         selected_model_summary = summary["models"][best_model]
         deployment_lock = {
-            "schema_version": 3,
+            "schema_version": 4,
             "bundle_version": BUNDLE_VERSION,
+            "split_protocol_version": SPLIT_PROTOCOL_VERSION,
             "experiment_fingerprint": stage_fingerprint,
             "split_manifest_sha256": preflight_report["split_manifest_sha256"],
             "selection_roles": {
@@ -3738,8 +4248,38 @@ def main() -> None:
             "foundation_models": (
                 "research-only until each model passes Core ML conversion and physical-device parity"
             ),
+            "cellect_v4": {
+                "selected_model": summary["cellect_v4"]["selected_model"],
+                "selected_model_score": summary["cellect_v4"][
+                    "selected_model_score"
+                ],
+                "run_contract_sha256": summary["cellect_v4"][
+                    "run_contract_sha256"
+                ],
+                "output_semantics": summary["cellect_v4"][
+                    "extended_output_semantics"
+                ],
+                "boundary_search": summary["cellect_v4"]["models"][
+                    summary["cellect_v4"]["selected_model"]
+                ]["boundary_search"]["selected_candidate"],
+                "coreml_and_physical_iphone_parity_required": True,
+            },
+            "cellect_track": {
+                "selected_candidate": summary["cellect_track"][
+                    "selected_candidate"
+                ],
+                "selected_thresholds": summary["cellect_track"][
+                    "selected_thresholds"
+                ],
+                "run_fingerprint": summary["cellect_track"]["run_fingerprint"],
+                "training_fingerprint_sha256": summary["cellect_track"][
+                    "training_fingerprint_sha256"
+                ],
+                "exports": summary["cellect_track"]["exports"],
+                "coreml_and_physical_iphone_parity_required": True,
+            },
         }
-        lock_path = RUNS / "deployment_lock_v3.json"
+        lock_path = RUNS / "deployment_lock_v4.json"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         lock_temporary = lock_path.with_suffix(".json.tmp")
         lock_temporary.write_text(json.dumps(deployment_lock, indent=2) + "\n")
@@ -3752,7 +4292,7 @@ def main() -> None:
         )
     archive = package_results(summary, best_model)
     if best_smoke:
-        smoke_marker = OUTPUT / "best_smoke_pass_v3.json"
+        smoke_marker = OUTPUT / "best_smoke_pass_v4.json"
         smoke_payload = {
             "status": "PASS",
             "bundle_version": BUNDLE_VERSION,
@@ -3760,6 +4300,7 @@ def main() -> None:
                 "dataset_fingerprint_sha256"
             ],
             "stage_fingerprint": stage_fingerprint,
+            "tracking_skipped": bool(summary.get("cellect_track_skipped")),
             "archive": str(archive),
             "completed_unix_seconds": time.time(),
         }

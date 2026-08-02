@@ -14,7 +14,10 @@ import re
 from pathlib import Path
 
 
-BUNDLE_VERSION = "3.1.0"
+BUNDLE_VERSION = "4.0.4"
+# Preserve the v3 hash salts deliberately.  This protocol identifier lets v4 record that the
+# acquisition roles are unchanged, so v3/v4 metrics are paired rather than measured on a reshuffle.
+SPLIT_PROTOCOL_VERSION = "cellect-acquisition-splits-v3-frozen-for-v4"
 VALIDATION_ROLES = ("checkpoint", "calibration", "ensemble_selection")
 LIVECELL_ROLES = ("train", *VALIDATION_ROLES)
 
@@ -67,7 +70,7 @@ def acquisition_group(value: str | Path) -> str:
 
 
 def scientific_group(dataset: str, value: str | Path) -> str:
-    """Return the dataset-aware acquisition group used for all v3 role checks."""
+    """Return the dataset-aware acquisition group used for all v4 role checks."""
     normalized_dataset = dataset.casefold()
     if normalized_dataset == "livecell":
         # LIVECell names encode one acquisition as

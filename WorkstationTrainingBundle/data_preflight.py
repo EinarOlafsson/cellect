@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Streaming, full-data integrity and split preflight for the Cellect v3 bundle."""
+"""Streaming, full-data integrity and split preflight for the Cellect v4 bundle."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from mask_targets import internal_contact_boundary
 from scientific_splits import (
     BUNDLE_VERSION,
     LIVECELL_ROLES,
+    SPLIT_PROTOCOL_VERSION,
     livecell_role,
     scientific_group,
     validation_role,
@@ -30,6 +31,15 @@ from scientific_splits import (
 
 
 _IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff"}
+
+
+class _UnusableDevelopmentSample(RuntimeError):
+    """A development pair whose labels carry no supervision for this task.
+
+    Published archives legitimately contain frames without a single annotated cell.  They are not
+    corrupt, so the preflight withholds them from training and records why instead of failing the
+    whole run.
+    """
 
 
 def _livecell_image(images_root: Path, file_name: str) -> Path:
@@ -98,6 +108,57 @@ def _sealed_asset(path: Path | None, label: str) -> tuple[Path | None, int, str]
     return resolved, resolved.stat().st_size, _file_sha256(resolved)
 
 
+def _seal_external_source_file_exclusions(
+    external_samples: list[ExternalSample],
+) -> tuple[list[dict[str, object]], set[Path], list[str], list[str]]:
+    """Hash and normalize source companions that cannot form image-anchored samples."""
+    rows: list[dict[str, object]] = []
+    paths: set[Path] = set()
+    fingerprint_rows: list[str] = []
+    errors: list[str] = []
+    exclusion_keys: set[tuple[str, str, str, str]] = set()
+    for sample in external_samples:
+        for exclusion in sample.source_file_exclusions:
+            key = (
+                sample.dataset,
+                exclusion.relative_path,
+                exclusion.role,
+                exclusion.reason,
+            )
+            if key in exclusion_keys:
+                continue
+            exclusion_keys.add(key)
+            try:
+                path, size, sha256 = _sealed_asset(
+                    exclusion.path, "excluded external source companion"
+                )
+                assert path is not None
+                if path in paths:
+                    raise RuntimeError(f"duplicate exclusion path: {path}")
+                paths.add(path)
+                rows.append(
+                    {
+                        "dataset": sample.dataset,
+                        "path": str(path),
+                        "relative_path": exclusion.relative_path,
+                        "role": exclusion.role,
+                        "size": size,
+                        "sha256": sha256,
+                        "reason": exclusion.reason,
+                    }
+                )
+                fingerprint_rows.append(
+                    "external-source-exclusion:"
+                    f"{sample.dataset}:{exclusion.relative_path}:{exclusion.role}:"
+                    f"{size}:{sha256}:{exclusion.reason}"
+                )
+            except Exception as error:
+                errors.append(
+                    f"{sample.dataset} excluded source file {exclusion.relative_path}: {error}"
+                )
+    return rows, paths, fingerprint_rows, errors
+
+
 def run_full_data_preflight(
     annotations_root: Path,
     images_root: Path,
@@ -116,6 +177,11 @@ def run_full_data_preflight(
     livecell_role_images: dict[str, int] = defaultdict(int)
     livecell_role_instances: dict[str, int] = defaultdict(int)
     livecell_group_roles: dict[str, set[str]] = defaultdict(set)
+    # LIVECell lists thirty files in both its train and its validation JSON.  The development pool
+    # is one acquisition-grouped set, so the second listing of a file is the same physical sample
+    # and must enter the manifest, the role tallies, and the fingerprint exactly once.
+    pooled_livecell_paths: set[Path] = set()
+    pooled_duplicate_images: list[str] = []
 
     # LIVECell train and validation form one acquisition-grouped development pool.  Parsing the
     # two development JSON files is intentional; the official test JSON is handled separately
@@ -186,13 +252,21 @@ def run_full_data_preflight(
                 group = scientific_group("livecell", metadata["file_name"])
                 role = livecell_role(metadata["file_name"])
                 livecell_group_roles[group].add(role)
-                livecell_role_images[role] += 1
-                livecell_role_instances[role] += len(annotations)
                 split_role_images[role] += 1
                 split_role_instances[role] += len(annotations)
                 stat = path.stat()
                 image_sha256 = _file_sha256(path)
                 split_hashes.add(image_sha256)
+                if path in pooled_livecell_paths:
+                    pooled_duplicate_images.append(str(path))
+                    fingerprint_rows.append(
+                        f"livecell:{split}:duplicate-listing:{path}:{image_sha256}:"
+                        f"{len(annotations)}"
+                    )
+                    continue
+                pooled_livecell_paths.add(path)
+                livecell_role_images[role] += 1
+                livecell_role_instances[role] += len(annotations)
                 manifest_rows.append(
                     {
                         "dataset": "livecell",
@@ -255,6 +329,8 @@ def run_full_data_preflight(
         "acquisition_group_counts_by_role": dict(sorted(livecell_group_counts.items())),
         "acquisition_groups": len(livecell_group_roles),
         "groups_crossing_roles": len(crossing_livecell_groups),
+        "pooled_images": len(pooled_livecell_paths),
+        "upstream_duplicate_listings": sorted(pooled_duplicate_images),
     }
 
     # Final-test label sealing: hash/size the JSON as opaque bytes.  Images are discovered from
@@ -339,7 +415,10 @@ def run_full_data_preflight(
     livecell_paths_by_split[test_split] = test_paths
     livecell_hashes_by_split[test_split] = test_hashes
 
-    for left, right in (("train", "val"), ("train", "test"), ("val", "test")):
+    # Train and validation are deliberately pooled, so a file listed in both upstream JSON files
+    # is a duplicate listing rather than leakage; it is deduplicated above and reported below.
+    # Any overlap with the sealed test split would be real leakage and still fails the run.
+    for left, right in (("train", "test"), ("val", "test")):
         overlap = livecell_paths_by_split[left] & livecell_paths_by_split[right]
         if overlap:
             errors.append(
@@ -352,6 +431,16 @@ def run_full_data_preflight(
                 f"LIVECell byte-identical content leakage between {left} and {right}: "
                 f"{len(hash_overlap)} images"
             )
+    upstream_duplicate_paths = (
+        livecell_paths_by_split.get("train", set())
+        & livecell_paths_by_split.get("val", set())
+    )
+    if pooled_duplicate_images:
+        warnings.append(
+            f"LIVECell repeats {len(pooled_duplicate_images)} image listing(s) inside or between "
+            f"its upstream train and validation JSON ({len(upstream_duplicate_paths)} of them "
+            "across the two files); each image was pooled once into the development set"
+        )
 
     external_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     external_cells: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -359,8 +448,18 @@ def run_full_data_preflight(
         lambda: defaultdict(int)
     )
     external_sealed_test_pairs: dict[str, int] = defaultdict(int)
+    withheld_development_samples: list[dict[str, str]] = []
+    unusable_contact_maps: list[str] = []
     seen_external_paths: dict[Path, tuple[str, str]] = {}
     seen_external_hashes: dict[str, tuple[str, str, Path]] = {}
+    (
+        external_source_file_exclusions,
+        excluded_external_paths,
+        exclusion_fingerprint_rows,
+        exclusion_errors,
+    ) = _seal_external_source_file_exclusions(external_samples)
+    fingerprint_rows.extend(exclusion_fingerprint_rows)
+    errors.extend(exclusion_errors)
     for sample in tqdm(external_samples, desc="preflight all external pairs"):
         try:
             image_path, image_size, image_sha256 = _sealed_asset(
@@ -377,6 +476,17 @@ def run_full_data_preflight(
             )
             assert image_path is not None
             assert mask_path is not None
+            selected_paths = {
+                path
+                for path in (image_path, mask_path, class_path, boundary_path)
+                if path is not None
+            }
+            selected_exclusions = selected_paths & excluded_external_paths
+            if selected_exclusions:
+                raise RuntimeError(
+                    "source file is both selected and excluded: "
+                    + ", ".join(str(path) for path in sorted(selected_exclusions))
+                )
             prior = seen_external_paths.get(image_path)
             if prior is not None and prior[1] != sample.split:
                 raise RuntimeError(
@@ -457,7 +567,7 @@ def run_full_data_preflight(
                     raise RuntimeError("image contains NaN or infinity")
                 cell_count = int(np.unique(labels[labels > 0]).size)
                 if cell_count < 1:
-                    raise RuntimeError("mask contains no cell instances")
+                    raise _UnusableDevelopmentSample("mask contains no cell instances")
                 if explicit_boundary is not None:
                     if explicit_boundary.shape != labels.shape:
                         raise RuntimeError("explicit boundary has the wrong shape")
@@ -467,10 +577,10 @@ def run_full_data_preflight(
                             labels, explicit_boundary
                         ).any()
                     ):
-                        raise RuntimeError(
-                            "DeepSea touching-edge map has no component adjacent to two "
-                            "reconstructed cells"
-                        )
+                        # DeepSea occasionally marks a touching edge at the rim of a single
+                        # reconstructed cell.  The frame still carries valid instances, so it is
+                        # kept and trained without an explicit contact target for that edge.
+                        unusable_contact_maps.append(str(sample.image_path))
                 external_cells[sample.dataset][sample.split] += cell_count
                 manifest_row.update(
                     {
@@ -495,6 +605,24 @@ def run_full_data_preflight(
                 f"{class_path or 'none'}:{class_size}:{class_sha256}:"
                 f"{boundary_path or 'none'}:{boundary_size}:{boundary_sha256}:"
                 f"{cell_count_fingerprint}"
+            )
+        except _UnusableDevelopmentSample as reason:
+            # Not a corruption: the frame is intact but carries no supervision.  Withhold it from
+            # the manifest so neither the preflight nor training ever selects it.  The identity of
+            # a withheld frame is only reachable after its assets were hashed above, so the
+            # fingerprint still changes if the archive stops shipping it.
+            withheld_development_samples.append(
+                {
+                    "dataset": sample.dataset,
+                    "split": sample.split,
+                    "image_path": str(sample.image_path),
+                    "image_sha256": image_sha256,
+                    "reason": str(reason),
+                }
+            )
+            fingerprint_rows.append(
+                f"{sample.dataset}:{sample.split}:withheld:{image_path}:{image_sha256}:"
+                f"{reason}"
             )
         except Exception as error:  # keep scanning to provide one actionable report
             errors.append(
@@ -538,6 +666,20 @@ def run_full_data_preflight(
             "LIVECell combined train/val development pool is missing roles: "
             + ", ".join(missing_livecell_roles)
         )
+    withheld_by_dataset: dict[str, int] = defaultdict(int)
+    for withheld in withheld_development_samples:
+        withheld_by_dataset[withheld["dataset"]] += 1
+    for dataset, count in sorted(withheld_by_dataset.items()):
+        warnings.append(
+            f"{dataset}: withheld {count} development frame(s) whose masks contain no cell "
+            "instances; they are excluded from training and from the split manifest"
+        )
+    if unusable_contact_maps:
+        warnings.append(
+            f"deepsea_phase: {len(unusable_contact_maps)} frame(s) carry a touching-edge map "
+            "that borders only one reconstructed cell; those frames train without an explicit "
+            "contact target"
+        )
     for dataset, counts in external_counts.items():
         if not counts.get("train"):
             warnings.append(f"{dataset} contributes no training images")
@@ -547,13 +689,23 @@ def run_full_data_preflight(
                 "generalization claim from its validation masks"
             )
     deepsea_total = sum(external_counts.get("deepsea_phase", {}).values())
+    deepsea_withheld_frames = sum(
+        1
+        for row in external_source_file_exclusions
+        if row["dataset"] == "deepsea_phase" and row["role"] == "image"
+    )
+    deepsea_discovered = deepsea_total + deepsea_withheld_frames
     # The public sample is 100 triplets. DeepSea's manuscript component counts total 3,624,
     # while the complete redistributed segmentation archive is indexed as 3,686; accept only
     # those known complete layouts so a missing multi-part Google Drive ZIP fails before training.
-    if deepsea_total not in {100, 3624, 3686}:
+    # Duplicate download copies are excluded before this count; acquisitions withheld because the
+    # official test split also contains them are added back, because they were genuinely present.
+    if deepsea_discovered not in {100, 3624, 3686}:
         errors.append(
             "DeepSea discovery is incomplete or unexpected: found "
-            f"{deepsea_total} strict image/mask/wmap triplets; expected either the verified "
+            f"{deepsea_discovered} strict image/mask/wmap triplets "
+            f"({deepsea_total} selected, {deepsea_withheld_frames} withheld from acquisitions "
+            "that the official test split also contains); expected either the verified "
             "100-pair public sample or a known complete 3,624/3,686-pair local collection"
         )
 
@@ -571,7 +723,7 @@ def run_full_data_preflight(
             "and prediction caches."
         )
 
-    manifest_path = destination.parent / "splits_v3.jsonl"
+    manifest_path = destination.parent / "splits_v4.jsonl"
     manifest_temporary = manifest_path.with_suffix(".jsonl.tmp")
     manifest_temporary.write_text(
         "".join(
@@ -582,8 +734,9 @@ def run_full_data_preflight(
     manifest_temporary.replace(manifest_path)
     manifest_sha256 = _file_sha256(manifest_path)
     report: dict[str, object] = {
-        "schema_version": 4,
+        "schema_version": 7,
         "bundle_version": BUNDLE_VERSION,
+        "split_protocol_version": SPLIT_PROTOCOL_VERSION,
         "status": "passed" if not errors else "failed",
         "completed_unix_seconds": time.time(),
         "duration_seconds": time.time() - started,
@@ -612,6 +765,19 @@ def run_full_data_preflight(
             dataset: dict(sorted(counts.items()))
             for dataset, counts in sorted(external_validation_roles.items())
         },
+        "withheld_development_samples": sorted(
+            withheld_development_samples,
+            key=lambda row: (row["dataset"], row["image_path"]),
+        ),
+        "deepsea_touching_edge_without_contact": sorted(unusable_contact_maps),
+        "external_source_file_exclusions": sorted(
+            external_source_file_exclusions,
+            key=lambda row: (
+                str(row["dataset"]),
+                str(row["relative_path"]),
+                str(row["role"]),
+            ),
+        ),
         "disk_free_gib": free_gib,
         "minimum_disk_free_gib": minimum_free_gib,
         "warnings": warnings,

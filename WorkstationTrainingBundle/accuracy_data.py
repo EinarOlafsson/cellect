@@ -18,9 +18,11 @@ import json
 import os
 import re
 import tarfile
+import time
+import urllib.error
 import urllib.request
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import quote
 
@@ -44,8 +46,8 @@ from scientific_splits import (
 
 
 YIM_URL = (
-    "https://tudatalib.ulb.tu-darmstadt.de/bitstream/handle/"
-    "tudatalib/3799/yeast_cell_in_microstructures_dataset.zip"
+    "https://tudatalib.ulb.tu-darmstadt.de/bitstreams/"
+    "4bba6f76-5377-4b1a-9566-7eea7c1ccb5a/download"
 )
 DEEPBACS_URL = (
     "https://zenodo.org/api/records/5550935/files/"
@@ -247,38 +249,65 @@ class ExternalSample:
     instance_path: Path
     class_path: Path | None = None
     boundary_path: Path | None = None
+    source_file_exclusions: tuple["ExternalSourceFileExclusion", ...] = ()
 
 
-def download(url: str, destination: Path) -> None:
+@dataclass(frozen=True)
+class ExternalSourceFileExclusion:
+    path: Path
+    relative_path: str
+    role: str
+    reason: str
+
+
+def download(url: str, destination: Path, *, attempts: int = 8) -> None:
+    """Download atomically, resuming partial bytes and retrying transient network failures."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists() and destination.stat().st_size > 1024:
         print(f"Reusing {destination}")
         return
+    if attempts < 1:
+        raise ValueError("Download attempts must be at least one")
     partial = destination.with_suffix(destination.suffix + ".partial")
-    existing = partial.stat().st_size if partial.exists() else 0
-    request = urllib.request.Request(url)
-    if existing:
-        request.add_header("Range", f"bytes={existing}-")
-    print(f"Downloading {url}")
-    with urllib.request.urlopen(request) as response:
-        resumed = existing > 0 and getattr(response, "status", None) == 206
-        mode = "ab" if resumed else "wb"
-        if existing and not resumed:
-            existing = 0
-        remaining_header = response.headers.get("Content-Length")
-        remaining = int(remaining_header) if remaining_header else None
-        with partial.open(mode) as target:
-            with tqdm(
-                total=(existing + remaining) if remaining else None,
-                initial=existing,
-                unit="B",
-                unit_scale=True,
-                desc=destination.name,
-            ) as progress:
-                while chunk := response.read(1024 * 1024):
-                    target.write(chunk)
-                    progress.update(len(chunk))
-    partial.replace(destination)
+    for attempt in range(1, attempts + 1):
+        existing = partial.stat().st_size if partial.exists() else 0
+        request = urllib.request.Request(url)
+        if existing:
+            request.add_header("Range", f"bytes={existing}-")
+        print(f"Downloading {url}")
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                resumed = existing > 0 and getattr(response, "status", None) == 206
+                mode = "ab" if resumed else "wb"
+                if existing and not resumed:
+                    existing = 0
+                remaining_header = response.headers.get("Content-Length")
+                remaining = int(remaining_header) if remaining_header else None
+                with partial.open(mode) as target:
+                    with tqdm(
+                        total=(existing + remaining) if remaining else None,
+                        initial=existing,
+                        unit="B",
+                        unit_scale=True,
+                        desc=destination.name,
+                    ) as progress:
+                        while chunk := response.read(1024 * 1024):
+                            target.write(chunk)
+                            progress.update(len(chunk))
+            partial.replace(destination)
+            return
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+            if attempt >= attempts:
+                raise RuntimeError(
+                    f"Download failed after {attempts} attempts: {url}. "
+                    f"Partial bytes remain resumable at {partial}"
+                ) from error
+            delay_seconds = min(60, 2 ** (attempt - 1))
+            print(
+                f"Download attempt {attempt}/{attempts} failed: {error}. "
+                f"Retrying in {delay_seconds}s; partial bytes are preserved."
+            )
+            time.sleep(delay_seconds)
 
 
 def safe_extract(archive_path: Path, destination: Path) -> None:
@@ -388,7 +417,63 @@ def discover_suffix_pairs(root: Path, dataset: str) -> list[ExternalSample]:
         )
     if not samples:
         raise RuntimeError(f"Could not find image/mask suffix pairs under {root}")
-    return unique_samples(samples)
+    return _drop_duplicate_image_content(unique_samples(samples), root)
+
+
+def _drop_duplicate_image_content(
+    samples: list[ExternalSample],
+    root: Path,
+) -> list[ExternalSample]:
+    """Keep one sample per distinct image content within a dataset.
+
+    A few published archives ship the same frame twice under different numbers.  The split hash
+    reads the file name, so the copies can land on opposite sides of a train/validation boundary
+    and quietly leak.  Retain the first copy in natural order and record the rest as excluded
+    source files so the duplication stays visible in the preflight provenance.
+    """
+    kept: list[ExternalSample] = []
+    first_by_content: dict[str, ExternalSample] = {}
+    exclusions: list[ExternalSourceFileExclusion] = []
+    resolved_root = root.resolve()
+    for sample in samples:
+        digest = file_sha256(sample.image_path)
+        original = first_by_content.get(digest)
+        if original is None:
+            first_by_content[digest] = sample
+            kept.append(sample)
+            continue
+        for role, path in (
+            ("image", sample.image_path),
+            ("mask", sample.instance_path),
+        ):
+            resolved = path.resolve()
+            exclusions.append(
+                ExternalSourceFileExclusion(
+                    path=resolved,
+                    relative_path=_relative_source_path(resolved, resolved_root, role),
+                    role=f"duplicate-{role}",
+                    reason=(
+                        "byte-identical image content already present as "
+                        f"{original.image_path.name}; excluded so one frame cannot cross "
+                        "a split boundary"
+                    ),
+                )
+            )
+    if exclusions and kept:
+        kept[0] = replace(
+            kept[0],
+            source_file_exclusions=tuple(
+                sorted(
+                    (*kept[0].source_file_exclusions, *exclusions),
+                    key=lambda item: (item.relative_path.casefold(), item.relative_path),
+                )
+            ),
+        )
+        print(
+            f"{kept[0].dataset}: excluded {len(exclusions) // 2} byte-identical duplicate "
+            "frame(s); paths and hashes are retained in full-data preflight provenance."
+        )
+    return kept
 
 
 def discover_cellpose_pairs(root: Path, dataset: str) -> list[ExternalSample]:
@@ -469,6 +554,20 @@ def _stable_path_key(path: Path) -> tuple[object, ...]:
     )
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(4 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+# Browsers and Google Drive append ``(1)``, ``(2)`` … when the same file is fetched twice.  The
+# canonical DeepSea segmentation release contains no such names, so a suffixed file that is a
+# byte-for-byte copy of the unsuffixed one is a download artefact, not a second acquisition.
+_DUPLICATE_COPY_SUFFIX = re.compile(r"\(\d+\)$")
+
+
 def deepsea_subfolders(root: Path) -> dict[str, Path]:
     if not root.is_dir():
         return {}
@@ -504,6 +603,17 @@ def find_local_deepsea_root(
     bundle_root = Path(__file__).resolve().parent
     if search_roots is None:
         environment_root = os.environ.get("CELLECT_DEEPSEA_ROOT")
+        if environment_root:
+            resolved_environment = Path(environment_root).expanduser().resolve()
+            environment_folders = deepsea_subfolders(resolved_environment)
+            if {"track", "segment", "final"} <= set(environment_folders):
+                print(f"DeepSea root selected from CELLECT_DEEPSEA_ROOT: {resolved_environment}")
+                return resolved_environment, environment_folders
+            raise RuntimeError(
+                "CELLECT_DEEPSEA_ROOT was set but does not contain complete "
+                "track/segment/final folders: "
+                f"{resolved_environment} (found roles={sorted(environment_folders)})"
+            )
         candidates = [
             bundle_root,
             bundle_root / "deepsea",
@@ -514,8 +624,6 @@ def find_local_deepsea_root(
             Path.cwd() / "deepsea",
             Path.cwd() / "DeepSea",
         ]
-        if environment_root:
-            candidates.insert(0, Path(environment_root).expanduser())
         for ancestor in list(bundle_root.parents)[:4]:
             candidates.extend((ancestor / "deepsea", ancestor / "DeepSea"))
     else:
@@ -532,11 +640,6 @@ def find_local_deepsea_root(
         if {"track", "segment", "final"} <= set(folders):
             print(f"DeepSea root selected: {resolved}")
             return resolved, folders
-    if search_roots is None and environment_root:
-        raise RuntimeError(
-            "CELLECT_DEEPSEA_ROOT was set but does not contain complete "
-            f"track/segment/final folders: {environment_root}"
-        )
     return None
 
 
@@ -580,6 +683,51 @@ def _deepsea_file_index(directory: Path, role: str) -> dict[str, Path]:
             )
         indexed[stem] = path
     return indexed
+
+
+def _relative_source_path(path: Path, root: Path, role: str) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError as error:
+        raise RuntimeError(
+            f"Excluded {role} resolves outside the selected dataset root: {path}"
+        ) from error
+
+
+def _drop_duplicate_download_copies(
+    index: dict[str, Path],
+    role: str,
+    resolved_root: Path,
+    exclusions: list[ExternalSourceFileExclusion],
+) -> None:
+    """Remove ``name(1)``-style copies that duplicate a canonical file byte for byte.
+
+    A local DeepSea collection assembled from Google Drive frequently carries such copies.  They
+    are the same acquisition under a second name, so leaving them in would double-count frames and
+    make the deterministic train/validation hash place one copy on each side of the split.  The
+    copies stay in the provenance record instead of disappearing silently.
+    """
+    for stem in sorted(index, key=lambda value: _stable_path_key(Path(value))):
+        canonical_stem = _DUPLICATE_COPY_SUFFIX.sub("", stem)
+        if canonical_stem == stem:
+            continue
+        canonical = index.get(canonical_stem)
+        path = index[stem]
+        if canonical is None or file_sha256(path) != file_sha256(canonical):
+            continue
+        resolved = path.resolve()
+        exclusions.append(
+            ExternalSourceFileExclusion(
+                path=resolved,
+                relative_path=_relative_source_path(resolved, resolved_root, role),
+                role=f"duplicate-{role}",
+                reason=(
+                    f"byte-identical duplicate download copy of {canonical.name}; "
+                    "excluded so one acquisition cannot appear twice"
+                ),
+            )
+        )
+        del index[stem]
 
 
 def deepsea_boundary_path(mask_directory: Path, mask_path: Path) -> Path | None:
@@ -644,28 +792,80 @@ def download_deepsea(destination: Path) -> Path:
     return destination
 
 
-def discover_deepsea(root: Path) -> list[ExternalSample]:
-    local_folders = deepsea_subfolders(root)
-    if {"track", "segment", "final"} <= set(local_folders):
-        # The official segmentation download is the canonical 3,686 image/cell-mask pairing.
-        # `final` contains the corresponding originals plus cell/nucleus masks, and `track`
-        # contains the same 47 time-lapse sets. Adding all three would triple-count frames and
-        # leak adjacent duplicates across the study. Prefer `segment`; keep the other two present
-        # for provenance and future temporal evaluation.
-        samples = discover_deepsea(local_folders["segment"])
-        print(
-            "DeepSea local collection: using "
-            f"{len(samples)} segmentation pairs; final/original and tracking folders "
-            "are recognized but not duplicated into segmentation training."
-        )
-        return samples
-    if local_folders:
-        missing_roles = sorted({"track", "segment", "final"} - set(local_folders))
-        raise RuntimeError(
-            f"Incomplete DeepSea collection under {root}; missing top-level roles: "
-            + ", ".join(missing_roles)
-        )
+def _withhold_deepsea_official_test_acquisitions(
+    samples: list[ExternalSample],
+    resolved_root: Path,
+    exclusions: list[ExternalSourceFileExclusion],
+) -> list[ExternalSample]:
+    """Drop training frames whose acquisition also appears in DeepSea's official test folder.
 
+    DeepSea distributes several z/c variants of the same annotated field across its own train and
+    test directories: ``A11`` through ``A19`` appear on both sides.  The official test split stays
+    intact so the published benchmark remains comparable, and the far larger training-side copies
+    of those acquisitions are withheld instead, which keeps one acquisition inside one scientific
+    role.
+    """
+    test_groups = {
+        scientific_group("deepsea_phase", sample.image_path)
+        for sample in samples
+        if sample.split == "test"
+    }
+    if not test_groups:
+        return samples
+    kept: list[ExternalSample] = []
+    withheld: list[ExternalSample] = []
+    for sample in samples:
+        group = scientific_group("deepsea_phase", sample.image_path)
+        if sample.split != "test" and group in test_groups:
+            withheld.append(sample)
+        else:
+            kept.append(sample)
+    for sample in withheld:
+        group = scientific_group("deepsea_phase", sample.image_path)
+        for role, path in (
+            ("image", sample.image_path),
+            ("mask", sample.instance_path),
+            ("wmap", sample.boundary_path),
+        ):
+            if path is None:
+                continue
+            resolved = path.resolve()
+            exclusions.append(
+                ExternalSourceFileExclusion(
+                    path=resolved,
+                    relative_path=_relative_source_path(resolved, resolved_root, role),
+                    role=role,
+                    reason=(
+                        f"acquisition {group} also appears in the official DeepSea test "
+                        "split; the training-side copy is withheld so one acquisition "
+                        "stays inside one scientific role"
+                    ),
+                )
+            )
+    if withheld:
+        withheld_groups = {
+            scientific_group("deepsea_phase", sample.image_path) for sample in withheld
+        }
+        print(
+            f"DeepSea segmentation: withheld {len(withheld)} training frame(s) from "
+            f"{len(withheld_groups)} acquisition(s) that the official test split also contains."
+        )
+    if not kept:
+        raise RuntimeError(
+            "Every DeepSea training frame shares an acquisition with the official test split"
+        )
+    return kept
+
+
+def _discover_deepsea_triplets(root: Path) -> list[ExternalSample]:
+    """Scan one selected segmentation branch, anchored to its raw image frames.
+
+    Google Drive's split archives introduce a wrapper such as
+    ``segment/segmentation_dataset``.  The inner name is also a valid *top-level* role alias, so
+    routing that branch back through :func:`discover_deepsea` would incorrectly diagnose a
+    second, incomplete collection.  Collection validation and branch scanning intentionally stay
+    separate here.
+    """
     groups = _deepsea_role_directories(root)
     if not groups:
         raise RuntimeError(
@@ -674,6 +874,8 @@ def discover_deepsea(root: Path) -> list[ExternalSample]:
         )
 
     samples: list[ExternalSample] = []
+    source_file_exclusions: list[ExternalSourceFileExclusion] = []
+    resolved_root = root.resolve()
     for parent in sorted(groups, key=_stable_path_key):
         roles = groups[parent]
         missing_directories = [role for role, paths in roles.items() if not paths]
@@ -696,22 +898,42 @@ def discover_deepsea(root: Path) -> list[ExternalSample]:
         images = _deepsea_file_index(image_directory, "image")
         masks = _deepsea_file_index(mask_directory, "mask")
         wmaps = _deepsea_file_index(wmap_directory, "wmap")
+        for role, index in (("image", images), ("mask", masks), ("wmap", wmaps)):
+            _drop_duplicate_download_copies(
+                index, role, resolved_root, source_file_exclusions
+            )
         image_stems = set(images)
         mask_stems = set(masks)
         wmap_stems = set(wmaps)
-        if not (image_stems == mask_stems == wmap_stems):
-            missing_images = sorted((mask_stems | wmap_stems) - image_stems)
-            missing_masks = sorted((image_stems | wmap_stems) - mask_stems)
-            missing_wmaps = sorted((image_stems | mask_stems) - wmap_stems)
-            orphan_images = sorted(image_stems - (mask_stems & wmap_stems))
-            orphan_masks = sorted(mask_stems - (image_stems & wmap_stems))
-            orphan_wmaps = sorted(wmap_stems - (image_stems & mask_stems))
+        missing_masks = sorted(image_stems - mask_stems)
+        missing_wmaps = sorted(image_stems - wmap_stems)
+        if missing_masks or missing_wmaps:
             raise RuntimeError(
-                f"DeepSea requires one image/mask/wmap per stem under {parent}: "
-                f"missing images={missing_images[:5]}, missing masks={missing_masks[:5]}, "
-                f"missing wmaps={missing_wmaps[:5]}, orphan images={orphan_images[:5]}, "
-                f"orphan masks={orphan_masks[:5]}, orphan wmaps={orphan_wmaps[:5]}"
+                f"DeepSea requires a mask and wmap for every image under {parent}: "
+                f"missing masks={missing_masks[:5]}, missing wmaps={missing_wmaps[:5]}"
             )
+
+        # Some official DeepSea exports contain companion files after the last available raw
+        # image. They cannot form supervised samples. Preserve their identity in the full-data
+        # fingerprint instead of treating them as images or silently discarding them.
+        for role, index, extra_stems in (
+            ("mask", masks, mask_stems - image_stems),
+            ("wmap", wmaps, wmap_stems - image_stems),
+        ):
+            for stem in sorted(extra_stems, key=lambda value: _stable_path_key(Path(value))):
+                path = index[stem].resolve()
+                relative_path = _relative_source_path(path, resolved_root, role)
+                source_file_exclusions.append(
+                    ExternalSourceFileExclusion(
+                        path=path,
+                        relative_path=relative_path,
+                        role=role,
+                        reason=(
+                            f"DeepSea {role} has no matching official raw image frame; "
+                            "excluded from segmentation supervision"
+                        ),
+                    )
+                )
 
         for stem in sorted(image_stems, key=lambda value: _stable_path_key(Path(value))):
             image_path = images[stem]
@@ -725,9 +947,53 @@ def discover_deepsea(root: Path) -> list[ExternalSample]:
                 )
             )
 
+    samples = unique_samples(samples)
     if not samples:
         raise RuntimeError(f"DeepSea contains no complete image/mask/wmap triplets under {root}")
-    return unique_samples(samples)
+    samples = _withhold_deepsea_official_test_acquisitions(
+        samples, resolved_root, source_file_exclusions
+    )
+    if source_file_exclusions:
+        ordered_exclusions = tuple(
+            sorted(
+                source_file_exclusions,
+                key=lambda item: (item.relative_path.casefold(), item.relative_path),
+            )
+        )
+        samples[0] = replace(samples[0], source_file_exclusions=ordered_exclusions)
+        print(
+            "DeepSea segmentation: excluded "
+            f"{len(ordered_exclusions)} source file(s) as duplicate copies, image-less "
+            "companions, or withheld acquisitions; paths and hashes will be retained in "
+            "full-data preflight provenance."
+        )
+    return samples
+
+
+def discover_deepsea(root: Path) -> list[ExternalSample]:
+    local_folders = deepsea_subfolders(root)
+    if {"track", "segment", "final"} <= set(local_folders):
+        # The official segmentation download is the canonical 3,686 image/cell-mask pairing.
+        # `final` contains the corresponding originals plus cell/nucleus masks, and `track`
+        # contains the same 47 time-lapse sets. Adding all three would triple-count frames and
+        # leak adjacent duplicates across the study. Prefer `segment`; keep the other two present
+        # for provenance and future temporal evaluation. Scan the selected branch directly so
+        # the real `segment/segmentation_dataset` wrapper cannot be mistaken for a partial root.
+        samples = _discover_deepsea_triplets(local_folders["segment"])
+        print(
+            "DeepSea local collection: using "
+            f"{len(samples)} segmentation pairs; final/original and tracking folders "
+            "are recognized but not duplicated into segmentation training."
+        )
+        return samples
+    if local_folders:
+        missing_roles = sorted({"track", "segment", "final"} - set(local_folders))
+        raise RuntimeError(
+            f"Incomplete DeepSea collection under {root}; missing top-level roles: "
+            + ", ".join(missing_roles)
+        )
+
+    return _discover_deepsea_triplets(root)
 
 
 def discover_suffix_pairs_if_available(root: Path, dataset: str) -> list[ExternalSample]:

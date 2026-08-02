@@ -3,10 +3,16 @@
 
 from __future__ import annotations
 
+import io
+import hashlib
+import os
 import tempfile
+import unittest
+import urllib.error
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -16,17 +22,21 @@ from cellpose import models as cellpose_models
 from accuracy_data import (
     ExternalCellDataset,
     ExternalSample,
+    ExternalSourceFileExclusion,
     discover_cellpose_pairs,
     discover_ctc_gold,
     discover_deepsea,
+    discover_suffix_pairs,
     deepsea_instance_labels,
     deepsea_subfolders,
+    download,
     find_local_deepsea_root,
     labels_to_targets as external_labels_to_targets,
     materialize_cellpose_pairs,
     normalize_uint8,
     source_split,
 )
+from data_preflight import _seal_external_source_file_exclusions
 from deployment_runtime import tiled_stitch_self_check
 from pipeline import (
     ACCURACY_CONFIG,
@@ -60,6 +70,74 @@ def expect_runtime_error(
             assert fragment in str(error), f"Expected {fragment!r} in {error!r}"
     else:
         raise AssertionError(f"Expected RuntimeError containing {fragments!r}")
+
+
+def check_resumable_download_retry() -> None:
+    payload = b"retry-contract" * 256
+
+    class FixtureResponse(io.BytesIO):
+        status = 200
+
+        def __init__(self, body: bytes):
+            super().__init__(body)
+            self.headers = {"Content-Length": str(len(body))}
+
+        def __enter__(self) -> "FixtureResponse":
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            self.close()
+
+    with tempfile.TemporaryDirectory(prefix="cellect-download-retry-") as temporary:
+        destination = Path(temporary) / "fixture.bin"
+        with (
+            patch(
+                "accuracy_data.urllib.request.urlopen",
+                side_effect=[
+                    urllib.error.URLError("temporary name-resolution failure"),
+                    FixtureResponse(payload),
+                ],
+            ) as mocked_open,
+            patch("accuracy_data.time.sleep") as mocked_sleep,
+        ):
+            download("https://fixture.invalid/data", destination, attempts=2)
+        assert destination.read_bytes() == payload
+        assert mocked_open.call_count == 2
+        mocked_sleep.assert_called_once_with(1)
+
+
+def check_external_exclusion_provenance() -> None:
+    with tempfile.TemporaryDirectory(prefix="cellect-exclusion-provenance-") as temporary:
+        root = Path(temporary)
+        image = root / "image.tif"
+        mask = root / "mask.tif"
+        orphan = root / "wmaps" / "frame195(1).tif"
+        orphan.parent.mkdir()
+        image.write_bytes(b"image")
+        mask.write_bytes(b"mask")
+        orphan.write_bytes(b"orphan-boundary-map")
+        exclusion = ExternalSourceFileExclusion(
+            path=orphan,
+            relative_path="train/wmaps/frame195(1).tif",
+            role="wmap",
+            reason="fixture image-less companion",
+        )
+        sample = ExternalSample(
+            "deepsea_phase",
+            "train",
+            image,
+            mask,
+            source_file_exclusions=(exclusion,),
+        )
+        rows, paths, fingerprint_rows, errors = _seal_external_source_file_exclusions(
+            [sample]
+        )
+        assert not errors
+        assert paths == {orphan.resolve()}
+        assert len(rows) == 1 and len(fingerprint_rows) == 1
+        assert rows[0]["relative_path"] == exclusion.relative_path
+        assert rows[0]["sha256"] == hashlib.sha256(orphan.read_bytes()).hexdigest()
+        assert str(rows[0]["sha256"]) in fingerprint_rows[0]
 
 
 def check_split_grouping() -> None:
@@ -259,7 +337,7 @@ def check_object_confidence_filter() -> None:
         [(foreground, boundary, truth, "synthetic")],
         "synthetic_artifact",
     )
-    # V3 evaluates 153 reconstruction settings, then 19 additional object-filter variants for
+    # V4 evaluates 153 reconstruction settings, then 19 additional object-filter variants for
     # each of the four AUC-selected reconstruction families.
     assert search["candidate_count"] == 153 + 4 * 19
     assert len(search["boundary_cutoff_curves"]) == 9
@@ -333,9 +411,13 @@ def check_dataset_adapters() -> None:
         assert sum(curated_counts[role] for role in VALIDATION_ROLES) == 1
 
         deepsea = root / "deepsea"
-        tracking_root = deepsea / "tracking_dataset"
-        segment_root = deepsea / "segmentation_dataset"
-        final_root = deepsea / "final_dataset"
+        # Reproduce the actual multi-ZIP Google Drive layout, including both wrapper levels.
+        tracking_branch = deepsea / "track"
+        segment_branch = deepsea / "segment"
+        final_branch = deepsea / "final"
+        tracking_root = tracking_branch / "tracking_dataset"
+        segment_root = segment_branch / "segmentation_dataset"
+        final_root = final_branch / "final_dataset"
         for directory in (tracking_root, segment_root, final_root):
             directory.mkdir(parents=True)
 
@@ -372,6 +454,8 @@ def check_dataset_adapters() -> None:
             (".png", ".tif", ".bmp"),
         )
         test_one = write_triplet(segment_root / "test", "frame001")
+        extra_wmap = segment_root / "train" / "wmaps" / "frame195(1).tif"
+        assert cv2.imwrite(str(extra_wmap), deepsea_touching)
 
         # Same-name and malformed decoys must never be ingested from tracking/final.
         for decoy_root in (tracking_root, final_root):
@@ -380,7 +464,7 @@ def check_dataset_adapters() -> None:
             assert cv2.imwrite(str(decoy_images / "frame001.tif"), image)
 
         assert set(deepsea_subfolders(deepsea)) == {"track", "segment", "final"}
-        assert deepsea_subfolders(deepsea)["segment"] == segment_root
+        assert deepsea_subfolders(deepsea)["segment"] == segment_branch
         # Explicit roots must not fall through to a real DeepSea directory beside the bundle.
         discovered_root = find_local_deepsea_root((deepsea,))
         assert discovered_root is not None
@@ -391,9 +475,45 @@ def check_dataset_adapters() -> None:
         deepsea_samples = discover_deepsea(deepsea)
         repeated_samples = discover_deepsea(deepsea)
         assert len(deepsea_samples) == 4
+        deepsea_exclusions = [
+            exclusion
+            for sample in deepsea_samples
+            for exclusion in sample.source_file_exclusions
+        ]
+        assert len(deepsea_exclusions) == 1
+        assert deepsea_exclusions[0].path == extra_wmap.resolve()
+        assert deepsea_exclusions[0].role == "wmap"
+        assert deepsea_exclusions[0].relative_path.endswith(
+            "train/wmaps/frame195(1).tif"
+        )
         assert [sample.image_path for sample in repeated_samples] == [
             sample.image_path for sample in deepsea_samples
         ]
+        # Keep compatibility with archives that omit the outer track/segment/final wrappers.
+        direct_deepsea = root / "deepsea_direct_collection"
+        direct_tracking = direct_deepsea / "tracking_dataset"
+        direct_segment = direct_deepsea / "segmentation_dataset"
+        direct_final = direct_deepsea / "final_dataset"
+        for directory in (direct_tracking, direct_segment, direct_final):
+            directory.mkdir(parents=True)
+        direct_triplet = write_triplet(direct_segment / "train", "direct001")
+        direct_samples = discover_deepsea(direct_deepsea)
+        assert [sample.image_path for sample in direct_samples] == [direct_triplet[0]]
+
+        partial_deepsea = root / "deepsea_partial_collection"
+        (partial_deepsea / "segmentation_dataset").mkdir(parents=True)
+        expect_runtime_error(
+            lambda: discover_deepsea(partial_deepsea),
+            ("Incomplete DeepSea collection", "final", "track"),
+        )
+        with patch.dict(os.environ, {"CELLECT_DEEPSEA_ROOT": str(deepsea)}):
+            configured = find_local_deepsea_root()
+            assert configured is not None and configured[0] == deepsea.resolve()
+        with patch.dict(os.environ, {"CELLECT_DEEPSEA_ROOT": str(partial_deepsea)}):
+            expect_runtime_error(
+                find_local_deepsea_root,
+                ("CELLECT_DEEPSEA_ROOT", "found roles", "segment"),
+            )
         assert all(sample.image_path.is_relative_to(segment_root) for sample in deepsea_samples)
         assert not any(
             sample.image_path.is_relative_to(tracking_root)
@@ -455,16 +575,21 @@ def check_dataset_adapters() -> None:
 
         orphan_root = root / "deepsea_orphans" / "train"
         write_triplet(orphan_root, "complete")
-        assert cv2.imwrite(str(orphan_root / "images" / "image_only.tif"), image)
         assert cv2.imwrite(
             str(orphan_root / "masks" / "mask_only.tif"), deepsea_binary
         )
         assert cv2.imwrite(
             str(orphan_root / "wmaps" / "wmap_only.tif"), deepsea_touching
         )
+        companion_samples = discover_deepsea(orphan_root.parent)
+        assert len(companion_samples) == 1
+        companion_exclusions = companion_samples[0].source_file_exclusions
+        assert len(companion_exclusions) == 2
+        assert {value.role for value in companion_exclusions} == {"mask", "wmap"}
+        assert cv2.imwrite(str(orphan_root / "images" / "image_only.tif"), image)
         expect_runtime_error(
             lambda: discover_deepsea(orphan_root.parent),
-            ("orphan images=", "orphan masks=", "orphan wmaps="),
+            ("missing masks=['image_only']", "missing wmaps=['image_only']"),
         )
 
         ambiguous_directory_root = root / "deepsea_ambiguous_directory" / "train"
@@ -488,7 +613,156 @@ def check_dataset_adapters() -> None:
         )
 
 
+def check_duplicate_and_leakage_exclusions() -> None:
+    """A duplicated download and a shared acquisition must leave the supervised sample list."""
+    image = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
+    binary = np.zeros((64, 64), dtype=np.uint8)
+    binary[12:52, 8:31] = 255
+    binary[12:52, 33:56] = 255
+    touching = np.zeros_like(binary)
+    touching[16:48, 31:33] = 255
+
+    with tempfile.TemporaryDirectory(prefix="cellect-duplicate-exclusions-") as temporary:
+        root = Path(temporary)
+        segment_root = root / "deepsea"
+
+        def write_triplet(split: str, stem: str) -> Path:
+            image_path = segment_root / split / "images" / f"{stem}.png"
+            mask_path = segment_root / split / "masks" / f"{stem}.png"
+            wmap_path = segment_root / split / "wmaps" / f"{stem}.png"
+            for path in (image_path, mask_path, wmap_path):
+                path.parent.mkdir(parents=True, exist_ok=True)
+            assert cv2.imwrite(str(image_path), image)
+            assert cv2.imwrite(str(mask_path), binary)
+            assert cv2.imwrite(str(wmap_path), touching)
+            return image_path
+
+        kept = write_triplet("train", "B04_z001_c001")
+        write_triplet("train", "A11_z002_c001")
+        write_triplet("test", "A11_z007_c001")
+        for role, source in (
+            ("images", kept),
+            ("masks", segment_root / "train" / "masks" / "B04_z001_c001.png"),
+            ("wmaps", segment_root / "train" / "wmaps" / "B04_z001_c001.png"),
+        ):
+            copy = segment_root / "train" / role / "B04_z001_c001(1).png"
+            copy.write_bytes(source.read_bytes())
+
+        samples = discover_deepsea(root / "deepsea")
+        selected = {sample.image_path.name for sample in samples}
+        assert selected == {"B04_z001_c001.png", "A11_z007_c001.png"}, selected
+        exclusions = [
+            exclusion
+            for sample in samples
+            for exclusion in sample.source_file_exclusions
+        ]
+        roles = sorted(exclusion.role for exclusion in exclusions)
+        assert roles == [
+            "duplicate-image",
+            "duplicate-mask",
+            "duplicate-wmap",
+            "image",
+            "mask",
+            "wmap",
+        ], roles
+        withheld = next(
+            exclusion for exclusion in exclusions if exclusion.role == "image"
+        )
+        assert withheld.relative_path.endswith("train/images/A11_z002_c001.png")
+        assert "official DeepSea test split" in withheld.reason
+
+        # A published archive that repeats one frame under two numbers must contribute it once.
+        qpi_root = root / "qpi_adherent" / "PC3"
+        qpi_root.mkdir(parents=True)
+        assert cv2.imwrite(str(qpi_root / "00127_PC3_img.tif"), image)
+        assert cv2.imwrite(str(qpi_root / "00127_PC3_mask.tif"), binary)
+        (qpi_root / "00128_PC3_img.tif").write_bytes(
+            (qpi_root / "00127_PC3_img.tif").read_bytes()
+        )
+        (qpi_root / "00128_PC3_mask.tif").write_bytes(
+            (qpi_root / "00127_PC3_mask.tif").read_bytes()
+        )
+        assert cv2.imwrite(str(qpi_root / "00200_PC3_img.tif"), image[::-1])
+        assert cv2.imwrite(str(qpi_root / "00200_PC3_mask.tif"), binary)
+        qpi_samples = discover_suffix_pairs(root / "qpi_adherent", "qpi_adherent")
+        assert [sample.image_path.name for sample in qpi_samples] == [
+            "00127_PC3_img.tif",
+            "00200_PC3_img.tif",
+        ]
+        qpi_exclusions = [
+            exclusion
+            for sample in qpi_samples
+            for exclusion in sample.source_file_exclusions
+        ]
+        assert {exclusion.role for exclusion in qpi_exclusions} == {
+            "duplicate-image",
+            "duplicate-mask",
+        }
+
+
+def check_v4_contracts() -> None:
+    """Run bounded orchestration contracts once, without network or external data.
+
+    The shape orchestration test already covers shape targets/models, teacher cache handoff,
+    three-phase optimization, frozen five-channel boundary search, exports, and resume.  The
+    tracking orchestration test already covers both tracking model tiers, all seven optimizer
+    phases, calibration/ensemble selection, and TorchScript parity.  Only the strict tracking
+    adapters and detailed identity metrics are tested separately because those are not duplicated
+    by the orchestration fixture.
+    """
+    from tracking_data import synthetic_self_test as tracking_data_self_test
+    from tracking_metrics import synthetic_self_test as tracking_metrics_self_test
+    from train_cellpose_sam import run_resume_contract_self_test
+    from v4_shape_training import run_contract_self_test as shape_self_test
+    from v4_tracking_training import synthetic_self_test as tracking_training_self_test
+
+    shape = shape_self_test()
+    assert shape["status"] == "PASS"
+    assert shape["boundary_search"] == "passed"
+    assert shape["resume"] == "passed"
+
+    tracking_data = tracking_data_self_test()
+    assert tracking_data["status"] == "PASS"
+    assert tracking_data["test_label_seal"] == "PASS"
+    assert tracking_data["ctmc_v1_train_only_adapter"] == "PASS"
+    assert tracking_data["alfi_duplicate_event_quarantine"] == "PASS"
+
+    tracking_metrics = tracking_metrics_self_test()
+    assert tracking_metrics["status"] == "PASS"
+    assert tracking_metrics["official_metric_claimed"] is False
+
+    cellpose_resume = run_resume_contract_self_test()
+    assert cellpose_resume["status"] == "PASS"
+    assert cellpose_resume["model_optimizer_rng_exact"] is True
+
+    tracking_training = tracking_training_self_test()
+    assert tracking_training["status"] == "PASS"
+    assert tracking_training["downloads_performed"] is False
+    assert tracking_training["official_test_labels_parsed"] is False
+    assert tracking_training["hungarian_adversarial_assignment"] == "PASS"
+    assert tracking_training["deployment_detector_perturbations"] == "PASS"
+    assert tracking_training["gap_recovery_and_censoring"] == "PASS"
+    assert tracking_training["candidate_specific_threshold_exports"] == "PASS"
+    assert all(
+        updates >= 1
+        for phases in tracking_training["real_optimizer_updates"].values()
+        for updates in phases.values()
+    )
+
+
+def check_coreml_artifact_bridge() -> None:
+    """Run portable hash/path/fixture tests without importing Core ML or PyTorch there."""
+
+    from coreml_bridge_contract_test import CoreMLBridgeContractTests
+
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(CoreMLBridgeContractTests)
+    result = unittest.TextTestRunner(verbosity=1).run(suite)
+    assert result.wasSuccessful(), "Core ML portable artifact contract checks failed"
+
+
 def main() -> None:
+    check_resumable_download_retry()
+    check_external_exclusion_provenance()
     check_foundation_models()
     check_split_grouping()
     check_validation_role_disjointness()
@@ -498,7 +772,10 @@ def main() -> None:
     check_yeast_ceiling()
     check_object_confidence_filter()
     check_dataset_adapters()
+    check_duplicate_and_leakage_exclusions()
     tiled_stitch_self_check()
+    check_v4_contracts()
+    check_coreml_artifact_bridge()
     print("Cellect workstation bundle self-check passed.")
 
 
