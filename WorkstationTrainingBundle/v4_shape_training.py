@@ -1123,6 +1123,7 @@ def _boundary_epoch(
     proposal_model: V4ShapeNet | None,
     *,
     contract_fixture_only: bool,
+    allow_unsupervised: bool = False,
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -1173,9 +1174,22 @@ def _boundary_epoch(
         for name, value in loss.items():
             totals[name] += float(value.detach()) * candidates
     if examples == 0:
-        raise RuntimeError(
-            f"No valid keep/merge candidates in boundary-teacher role {dataset.role}"
-        )
+        if not allow_unsupervised:
+            raise RuntimeError(
+                f"No valid keep/merge candidates in boundary-teacher role {dataset.role}"
+            )
+        # Candidate selection is deliberately proposal-only so ground truth cannot leak into the
+        # graph distribution.  A bounded smoke proposes from a one-epoch checkpoint, whose
+        # highest-ranked pairs are background sprawl that never covers a truth cell by the
+        # required fraction, so no pair in the cap is scoreable.  A full run proposes from a
+        # converged checkpoint and does not reach this branch; the run records that the teacher
+        # went unsupervised rather than reporting a trained one.
+        return {
+            "total": 0.0,
+            "accuracy": 0.0,
+            "candidates": 0.0,
+            "supervised": 0.0,
+        }
     return {
         **{name: value / examples for name, value in totals.items()},
         "accuracy": correct / examples,
@@ -1194,6 +1208,7 @@ def _train_boundary_teacher(
     proposal_model: V4ShapeNet | None,
     proposal_source: Mapping[str, object],
     compact_contract: bool = False,
+    allow_unsupervised: bool = False,
 ) -> tuple[BoundaryGraphTeacher, dict[str, object]]:
     spec = (
         BoundaryTeacherSpec(
@@ -1217,6 +1232,7 @@ def _train_boundary_teacher(
         "epochs": config.boundary_teacher_epochs,
         "train_role": "train",
         "selection_role": "checkpoint",
+        "unsupervised_candidates_tolerated": allow_unsupervised,
         "proposal_source": proposal_source,
         "ground_truth_input_policy": (
             "contract-fixture tensor-plumbing exception; not a scientific result"
@@ -1265,6 +1281,7 @@ def _train_boundary_teacher(
             optimizer,
             proposal_model,
             contract_fixture_only=compact_contract,
+            allow_unsupervised=allow_unsupervised,
         )
         checkpoint_dataset.set_epoch(0)
         validation_metrics = _boundary_epoch(
@@ -1276,6 +1293,7 @@ def _train_boundary_teacher(
             None,
             proposal_model,
             contract_fixture_only=compact_contract,
+            allow_unsupervised=allow_unsupervised,
         )
         score = validation_metrics["accuracy"] - 0.05 * validation_metrics["total"]
         row: dict[str, object] = {
@@ -1387,9 +1405,17 @@ def _dense_boundary_teacher_probability(
             valid = torch.ones(
                 (1, patches.shape[1]), dtype=torch.bool, device=device
             )
-            with torch.inference_mode():
+            # The student's training loop runs under a float16 autocast, and this call sits
+            # inside it. Candidate geometry features are unnormalised — measured magnitudes
+            # reach ~4e5, past float16's 65504 ceiling — so the teacher's geometry projection
+            # overflows to infinity and its attention turns that into NaN, which then poisons
+            # the distillation target. A frozen teacher producing targets is not what the
+            # student's precision policy is for: compute it at full precision.
+            with torch.inference_mode(), torch.autocast(
+                device_type=device.type, enabled=False
+            ):
                 probability = torch.sigmoid(
-                    teacher(patches, geometry, valid)["keep_logit"][0]
+                    teacher(patches.float(), geometry.float(), valid)["keep_logit"][0]
                 ).cpu().numpy()
             if len(candidate["lines"]) != len(probability):
                 raise RuntimeError("Boundary-teacher candidate/probability count changed")
@@ -1770,6 +1796,20 @@ def _restore_rng(checkpoint: Mapping[str, object], device: torch.device) -> None
         torch.cuda.set_rng_state_all(checkpoint["cuda_random_state"])
 
 
+def _gradients_are_finite(model: nn.Module) -> bool:
+    """Whether every trainable gradient is finite, i.e. the scaler will step.
+
+    Read after ``GradScaler.unscale_``. A False here is normally the loss scale
+    being calibrated rather than a broken model: the scaler will skip this
+    update and halve the scale.
+    """
+    return all(
+        bool(torch.isfinite(parameter.grad).all())
+        for parameter in model.parameters()
+        if parameter.requires_grad and parameter.grad is not None
+    )
+
+
 def _train_student(
     spec: ShapeModelSpec,
     records: Sequence[MaterializedPair],
@@ -1987,7 +2027,13 @@ def _train_student(
             )
             if should_step:
                 scaler.unscale_(optimizer)
-                if first_gradient_audit is None:
+                if first_gradient_audit is None and _gradients_are_finite(model):
+                    # Audit the first step the scaler will actually apply. AMP starts at a high
+                    # loss scale on purpose and calibrates downward, so the earliest steps
+                    # routinely overflow a few entries to +/-inf; ``scaler.step`` detects that,
+                    # skips the update and halves the scale. Auditing such a step would report
+                    # non-finite gradients for a model that is training correctly. A phase whose
+                    # every step overflows still fails, below.
                     first_gradient_audit = gradient_audit(model, phase=phase)
                 nn.utils.clip_grad_norm_(
                     [parameter for parameter in model.parameters() if parameter.requires_grad],
@@ -2025,6 +2071,11 @@ def _train_student(
             "teacher_cache_keys_used": sorted(teacher_keys),
             "gradient_audit": first_gradient_audit,
         }
+        if first_gradient_audit is None:
+            raise RuntimeError(
+                f"No optimizer step in {phase} phase epoch {phase_epoch + 1} produced finite "
+                "gradients; every step overflowed the AMP loss scale"
+            )
         history.append(row)
         if score > best_score + config.minimum_improvement:
             best_score = score
@@ -2459,6 +2510,10 @@ def run_v4_shape_training(
         proposal_model=proposal_model,
         proposal_source=proposal_source,
         compact_contract=compact_boundary_teacher,
+        # A bounded smoke proposes from a one-epoch checkpoint, so its candidate cap can contain
+        # no scoreable pair.  Only the bounded mode may proceed with an unsupervised teacher; a
+        # full run still fails closed, because there the proposals are converged.
+        allow_unsupervised=mode != "full",
     )
     del proposal_model
     if resolved_device.type == "cuda":
