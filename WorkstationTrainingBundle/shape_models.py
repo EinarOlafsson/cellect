@@ -1233,6 +1233,50 @@ def set_training_phase(model: V4ShapeNet, phase: str) -> dict[str, object]:
     }
 
 
+#: Transformer stage attributes on a Mix Vision Transformer encoder. Only these are wrapped;
+#: a convolutional backbone has none of them and is left exactly as it was.
+_TRANSFORMER_STAGE_NAMES = ("block1", "block2", "block3", "block4")
+
+
+def enable_gradient_checkpointing(model: V4ShapeNet) -> int:
+    """Recompute transformer-block activations in backward instead of storing them.
+
+    The mit_b5 context student holds every block's activations at 768x768, which peaks above
+    a 24 GB card in the ``full`` phase where nothing is frozen; measured 18.6 GiB with this on
+    against an out-of-memory failure without it. The arithmetic is unchanged — the blocks are
+    simply re-run during backward — so this costs time, not results.
+
+    Each block's ``forward`` is wrapped in place rather than the block being replaced by a
+    wrapper module, because a wrapper would rename every parameter beneath it and break v3
+    initialization, the freeze-phase prefixes and every existing checkpoint.
+
+    Returns the number of blocks wrapped, so a caller can record that it happened.
+    """
+    from torch.utils.checkpoint import checkpoint
+
+    encoder = getattr(getattr(model, "semantic_backbone", None), "encoder", None)
+    if encoder is None:
+        return 0
+    wrapped = 0
+    for stage_name in _TRANSFORMER_STAGE_NAMES:
+        for block in getattr(encoder, stage_name, None) or ():
+            if getattr(block, "_cellect_checkpointed", False):
+                continue
+            original = block.forward
+
+            def forward(*args, _original=original, _block=block, **kwargs):
+                # Inference and frozen phases keep the plain path: there is no activation to
+                # store when no graph is being built, so recomputation would be pure cost.
+                if _block.training and torch.is_grad_enabled():
+                    return checkpoint(_original, *args, use_reentrant=False, **kwargs)
+                return _original(*args, **kwargs)
+
+            block.forward = forward
+            block._cellect_checkpointed = True
+            wrapped += 1
+    return wrapped
+
+
 def gradient_audit(
     model: V4ShapeNet,
     *,

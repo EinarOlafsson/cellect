@@ -68,6 +68,7 @@ from shape_models import (
     ShapeModelSpec,
     V4ShapeNet,
     V4_SHAPE_MODEL_SPECS,
+    enable_gradient_checkpointing,
     gradient_audit,
     initialize_from_v3,
     multitask_shape_loss,
@@ -1837,6 +1838,11 @@ def _train_student(
         for role in SCIENTIFIC_ROLES
     }
     model = V4ShapeNet(spec).to(device)
+    # The context student's transformer stages cannot hold their 768x768 activations for an
+    # unfrozen backbone on a 24 GB card. Recomputing them in backward is arithmetically
+    # identical and brings the measured peak from out-of-memory down to 18.6 GiB. Backbones
+    # without transformer stages are untouched, so this is a no-op for the mobile student.
+    checkpointed_blocks = enable_gradient_checkpointing(model)
     initialization: dict[str, object]
     if v3_checkpoint is not None:
         initialization = initialize_from_v3(model, v3_checkpoint)
@@ -2175,6 +2181,9 @@ def _train_student(
     return model, {
         "spec": asdict(spec),
         "initialization": initialization,
+        # Zero for a convolutional student; non-zero says its transformer activations were
+        # recomputed in backward rather than stored, which changes memory, not arithmetic.
+        "gradient_checkpointed_blocks": checkpointed_blocks,
         "best_checkpoint": str(best_path),
         "best_checkpoint_sha256": file_sha256(best_path),
         "best_checkpoint_selection_score": float(best["selection_score"]),
